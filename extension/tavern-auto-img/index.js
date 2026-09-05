@@ -168,9 +168,14 @@ async function stEngineer(text, family) {
         signal: stAbort ? stAbort.signal : undefined,
     });
     const j = await r.json();
-    if (!r.ok) throw new Error(String(j?.error?.message || 'LLM 调用失败 ' + r.status));
+    if (!r.ok) {
+        console.log('[ta-img][diag] 提示词 LLM 失败：status=', r.status, '| 响应=', JSON.stringify(j).slice(0, 300));
+        taLogRun({ llm: '❌ HTTP ' + r.status + '：' + String(j?.error?.message || '').slice(0, 80) });
+        throw new Error(String(j?.error?.message || 'LLM 调用失败 ' + r.status));
+    }
     const content = j?.choices?.[0]?.message?.content || '';
     console.log('[ta-img][diag] 提示词返回：content长度=', content.length, '| 前80字=', content.slice(0, 80).replace(/\n/g, ' '));
+    taLogRun({ llm: '✅ ' + llmModel + ' content=' + content.length + '字' });
     try {
         const m = content.match(/\{[\s\S]*\}/);
         const p = JSON.parse(m ? m[0] : content);
@@ -212,7 +217,7 @@ async function stPreflight(family, comfyUrl) {
 }
 
 /** 无桥模式：全链出图（工程器 → 工作流 → ST 代理 → 存文件 → 嵌入聊天） */
-async function generateViaST(text, name) {
+async function generateViaST(text, name, lock) {
     console.log('[ta-img][st] ① 进入无桥出图', { textLen: (text || '').length, name });
     const localCfg = taGetLocalCfg();
     const runStart = Date.now();
@@ -267,7 +272,7 @@ async function generateViaST(text, name) {
     const url = await saveBase64AsFile(result.data, (name || '生图').replace(/[\\/]/g, '_'), fname, fmt);
     console.log('[ta-img][st] ⑦ 上传成功，url =', url);
     taLogRun({ status: '✅ 成功', secs: Math.round((Date.now() - runStart) / 1000), url: url }, true);
-    showImage({ url: url, name: name, model: modelFile });
+    showImage({ url: url, name: name, model: modelFile }, lock);
     console.log('[ta-img][st] ⑧ showImage 调用完成');
     return url;
 }
@@ -295,33 +300,33 @@ function injectTaSpinKeyframes() {
     taSpinInjected = true;
     $('head').append('<style>@keyframes taSpin{to{transform:rotate(360deg)}}.ta-img-ph{display:flex;align-items:center;gap:12px;width:fit-content;min-width:260px;max-width:480px;margin:6px 0 10px;padding:12px 16px;border-radius:12px;background:rgba(255,255,255,.04);border:1px dashed rgba(255,255,255,.3);color:#aeb4c6;font-size:15px}.ta-img-spin{width:20px;height:20px;border:3px solid rgba(255,255,255,.18);border-top-color:#818cf8;border-radius:50%;animation:taSpin 1s linear infinite;flex-shrink:0}.ta-img-done{margin:6px 0 10px;border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,.12);display:inline-block;max-width:480px;background:rgba(255,255,255,.03)}.ta-img-done img{display:block;max-width:480px;width:100%;height:auto;border-radius:12px;}</style>');
 }
-function addImgPlaceholder(msgId, msgName) {
-    let $el = msgId ? $('.mes[mesid="' + msgId + '"]') : $();
+function addImgPlaceholder(el, msgName) {
+    let $el = (el && el.isConnected) ? $(el) : $();
     if (!$el.length && msgName) $el = $('.mes[ch_name="' + msgName + '"]').last();   // 按角色名找本次回复
     if (!$el.length) $el = $('.mes[is_user="false"]').last();
     if (!$el.length) return;                          // 聊天区无消息：跳过（不阻断出图）
-    if ($el.find('.ta-img-ph').length) return;        // 已有占位不重复
+    if ($el.find('.ta-img-ph').length) return;        // 已有占位不重复（该楼层的）
     injectTaSpinKeyframes();
     const $txt = $el.find('.mes_text').last();
-    const first = !$el.find('.ta-img-ph, .ta-img-done').length;   // 第一条图 → 文本上方；第二条 → 文本下方
     const html = '<div class="ta-img-ph"><span class="ta-img-spin"></span><span>自动文生图：正在生成图…（完成后自动显示）</span></div>';
-    if ($txt.length && first) {
-        $txt.before(html);
-    } else if ($txt.length) {
-        $txt.after(html);
+    if ($txt.length) {
+        $txt.after(html);   // 统一文本下方（用户偏好：图在剧情文本下面）
     } else {
         $el.append(html);
     }
+    console.log('[ta-img][diag] 占位符已插入（楼层=', (el && el.isConnected ? '锚定' : '找回'), '）');
 }
-function replaceImgPlaceholder(url) {
-    const $p = $('.ta-img-ph').first();
+function replaceImgPlaceholder(url, el) {
+    // 占位符=图槽：原地把占位符换成成品图（绑定该楼层，不删重插、位置不变）
+    const $p = (el && el.isConnected) ? $(el).find('.ta-img-ph').first() : $('.ta-img-ph').first();
     if (!$p.length) return false;
-    // 占位符只负责"加载中"提示；成品图统一走 ST 官方媒体渲染（避免与官方媒体重复显示两份）
-    $p.remove();
+    $p.replaceWith('<img class="ta-img-real" src="' + url + '" style="max-width:480px;display:block;height:auto;border-radius:12px;margin:6px 0 10px;">');
+    console.log('[ta-img][diag] 占位符→成品图（同楼层原位替换）');
     return true;
 }
-function removeImgPlaceholder() {
-    $('.ta-img-ph').remove();
+function removeImgPlaceholder(el) {
+    if (el && el.isConnected) $(el).find('.ta-img-ph').remove();
+    else $('.ta-img-ph').remove();
 }
 
 // 出图运行日志：每次触发记录（提示词/模型/耗时/结果），localStorage 滚动 50 条，面板可查
@@ -365,7 +370,7 @@ async function taInterruptImageTask() {
 const shownImages = new Set();
 
 
-function showImage(data) {
+function showImage(data, lock) {
     try {
         const url = data.url || data.image;
         console.log('[ta-img][st] ⑨ showImage 进入, url=', url);
@@ -373,18 +378,38 @@ function showImage(data) {
         // 三重防重：同 url 已显示 → 跳过（不管谁重复投递）
         if (shownImages.has(url)) return;
         shownImages.add(url);
-        // 有占位符 → 先即时替换成图（视觉；数据层下面继续挂）
-        const replaced = replaceImgPlaceholder(url);
+        // 有占位符 → 占位符=图槽：原地替换成图（绑定楼层；消息快也不串楼层）
+        const replaced = replaceImgPlaceholder(url, lock && lock.el);
         // 兜底：chat 里已存在同 url 消息 → 跳过
         const ctx = getCtx();
         if (ctx && ctx.chat && ctx.chat.some(m => m.extra && m.extra.media && m.extra.media.some(x => x.url === url))) { if (replaced) toastr.success('✨ 已生成图片', '自动文生图'); return; }
         // ── 附加到目标角色消息（不新增消息）────────────────────
-        // 目标 = 本次触发者 pendingImgTarget（仍在 chat 中）；否则取最近一条
-        // 非用户、非系统、且名称不含「生图/文生图」的消息
+        // 绑定定死：图自带任务锁 lock。优先用【楼层锚】（触发时抓住的 .mes 元素）→ 原地放图；
+        // 楼层失效时再按 消息对象引用 / send_date+文本头 匹配；都失败=不错挂（图文件保留）
         let target = null;
+        let $el = null;
+        if (lock && lock.el && lock.el.isConnected) {
+            // ① 楼层锚（主）：元素还在页面上 → 直接用这一层
+            $el = $(lock.el);
+            if (ctx && ctx.chat) {
+                const nm = $el.attr('ch_name') || '';
+                const idx = $('.mes[is_user="false"]').index($el);
+                const list = ctx.chat.filter(m => m && !m.is_user && !m.is_system);
+                if (idx >= 0 && list[idx]) target = list[idx];   // 楼层序号 → chat 对应消息（数据层）
+                if (!target && nm) target = ctx.chat.find(m => m && !m.is_user && String(m.name || '') === nm) || null;
+            }
+            if (!target) console.log('[ta-img][diag] 楼层锚在但数据配对失败（idx/名字），仍就地显示图');
+        }
         if (ctx && ctx.chat) {
-            if (pendingImgTarget && ctx.chat.some(m => m && m.id === pendingImgTarget.id)) target = pendingImgTarget;
-            if (!target) {
+            if (!target && lock && lock.msg && ctx.chat.some(m => m === lock.msg)) target = lock.msg;   // ② 对象引用直配
+            if (!target && lock && lock.sendDate) {   // ③ send_date+trim文本头 匹配（重roll/编辑后对象被替换时）
+                const sd = String(lock.sendDate);
+                const hd = String(lock.head || '').trim();
+                target = ctx.chat.find(m => m && !m.is_user && !m.is_system && String(m.send_date || '') === sd && String(m.mes || '').trim().slice(0, 40) === hd) || null;
+                if (!target) target = ctx.chat.find(m => m && !m.is_user && !m.is_system && String(m.send_date || '') === sd) || null;
+            }
+            if (!target && pendingImgTarget && ctx.chat.some(m => m === pendingImgTarget)) target = pendingImgTarget;   // ④ 兼容
+            if (!target && !lock) {   // ⑤ 无 lock（桥兼容端点）→ 最后一条角色回复（旧行为）
                 for (let i = ctx.chat.length - 1; i >= 0; i--) {
                     const m = ctx.chat[i];
                     if (!m) continue;
@@ -393,27 +418,37 @@ function showImage(data) {
                 }
             }
         }
+        // 楼层锚失效且消息也没找到 → 不错挂（图文件保留）
+        if (!target && lock) {
+            console.warn('[ta-img][diag] 目标消息已不在聊天中/被替换，跳过挂载 url=', url, 'lock=', lock.sendDate);
+            toastr.info('图已生成，但对应回复已变化，未挂载', '自动文生图');
+            return;
+        }
+        // 楼层锚无效时才用数据层找元素（虚拟滚动可能重建元素：mesid/ch_name/最后一条）
+        if (target && !$el) {
+            $el = $('.mes[mesid="' + target.id + '"]');
+            if (!$el.length && target.name) $el = $('.mes[ch_name="' + target.name + '"]').last();
+            if (!$el.length) $el = $('.mes[is_user="false"]').last();
+        }
         if (target) {
             target.extra = target.extra || {};
             target.extra.media = target.extra.media || [];
             if (!target.extra.media.some(x => x.url === url)) {
                 target.extra.media.push({ url: url, type: 'image', title: data.model || '' });
-                let $el = $('.mes[mesid="' + target.id + '"]');
-                if (!$el.length && target.name) $el = $('.mes[ch_name="' + target.name + '"]').last();   // 无 id：按角色名找本次回复
-                if (!$el.length) $el = $('.mes[is_user="false"]').last();   // 最后兜底：最后一条角色回复
-                console.log('[ta-img][diag] showImage 挂载目标=', target.id, '| replaced=', replaced, '| elLen=', $el.length, '| 消息名=', target.name || '', '| chat 最后=', (getCtx()?.chat?.length ?? -1));
-                if ($el.length) {
-                    try { appendMediaToMessage(target, $el, 'keep'); console.log('[ta-img][diag] appendMediaToMessage 完成（replaced=' + replaced + '）'); } catch (e2) { console.warn('[tavern-auto-img] 追加媒体渲染失败:', e2); }
-                } else {
-                    // 虚拟滚动：目标消息不在渲染池 → 滚到底触发渲染后重试一次
-                    console.info('[tavern-auto-img] 目标消息未渲染，滚动重试…', target.id);
-                    const $chat = $('#chat');
-                    if ($chat.length) {
-                        $chat.scrollTop($chat[0].scrollHeight);
-                        setTimeout(() => {
-                            const $el2 = $('.mes[mesid="' + target.id + '"]');
-                            if ($el2.length) { try { appendMediaToMessage(target, $el2, 'keep'); } catch (e3) { /* 忽略 */ } }
-                        }, 600);
+                const isAnchor = lock && lock.el && lock.el.isConnected;
+                console.log('[ta-img][diag] showImage 挂载目标=', target.id, '| replaced=', replaced, '| elLen=', $el.length, '| 消息名=', target.name || '', '| 楼层/', isAnchor ? '锚定' : '找回', '| chat 最后=', (getCtx()?.chat?.length ?? -1));
+                // 视觉：占位符=图槽已原位替换（replaced=true）→ 完成；
+                // 否则（占位符被ST清/丢失）→ 在该楼层媒体区/尾部补插一张（图槽兜底，绝不错层）
+                if (!replaced) {
+                    const $cam = $el.length ? $el : (isAnchor ? $(lock.el) : $());
+                    const $w = $cam.find('.mes_media_wrapper');
+                    const imgHtml = '<img class="ta-img-real" src="' + url + '" style="max-width:480px;display:block;height:auto;border-radius:12px;margin:6px 0 10px;">';
+                    if ($w.length) {
+                        if (!$w.find('img[src="' + url + '"]').length) $w.append(imgHtml);
+                        console.log('[ta-img][diag] 图槽兜底：媒体区补插完成');
+                    } else if ($cam.length) {
+                        $cam.append(imgHtml);
+                        console.log('[ta-img][diag] 图槽兜底：楼层尾部补插完成');
                     }
                 }
             }
@@ -1888,6 +1923,7 @@ function buildPanelUI($host) {
             return '<div style="margin-bottom:12px;padding:8px 10px;border-radius:10px;background:rgba(0,0,0,.25);">' +
                 `<div style="color:#34d399;">#${logs.length - i}　${l.ts || ''}　${l.channel || ''}　${l.status || ''}${l.secs != null ? '（' + l.secs + 's）' : ''}</div>` +
                 `<div style="color:#9aa;">模型：${l.model || '未选(自动兜底)'}　家族：${l.family || '-'}</div>` +
+                (l.llm ? `<div style="color:#fbbf24;">LLM：${l.llm}</div>` : '') +
                 (p ? `<div style="margin-top:4px;color:#e8e8f2;word-break:break-all;"><b>正向提示词：</b>${p}</div>` : '') +
                 (l.negative ? `<div style="color:rgba(230,230,242,.55);word-break:break-all;"><b>负向：</b>${l.negative.slice(0, 180)}${l.negative.length > 180 ? '…' : ''}</div>` : '') +
                 (l.error ? `<div style="color:#f87171;word-break:break-all;"><b>错误：</b>${l.error}</div>` : '') +
@@ -2065,7 +2101,7 @@ function getCtx() {
     try { return window.SillyTavern.getContext(); } catch (e) { return null; }
 }
 
-async function triggerOnce(msg, overrideText) {
+async function triggerOnce(msg, overrideText, lockIn) {
     const ctx = getCtx();
     // 从 chat 里取当前消息（ST 消息无 id → 用对象引用/send_date 判定最近一条）
     const last = ctx && ctx.chat && ctx.chat.length ? ctx.chat[ctx.chat.length - 1] : null;
@@ -2091,17 +2127,19 @@ async function triggerOnce(msg, overrideText) {
     const seenKey = String(msg.send_date || msg.id || '') + '|' + String((msg.mes || '').length);
     if (seenMessages.has(seenKey)) return;
     seenMessages.add(seenKey);
-    pendingImgTarget = msg;   // 图片附加到这条角色回复下方（桥/无桥两端都设）
+    pendingImgTarget = msg;   // 兼容保留（新版主要用 lock）
     if (seenMessages.size > 100) {
         const first = seenMessages.values().next().value;
         seenMessages.delete(first);
     }
     const text = String(overrideText || msg.mes || msg.message || '').trim();
     if (!text) return;
+    // 任务锁：图片/占位符与本次回复绑定定死（第二条消息触发时不覆盖第一条；且不删第一条的占位符）
+    const lock = Object.assign({}, lockIn || {}, { msg: msg, sendDate: String(msg.send_date || ''), head: String(text).slice(0, 40) });
     console.log('[tavern-auto-img] 收到角色回复, 触发自动文生图, id=', msg.id, 'send_date=', msg.send_date);
     // 通道选择：桥活着 → 桥；桥没起 → ST 原生代理（无桥模式）；都没有 → 提示装桥
     const channel = await detectChannel();
-    if (channel !== 'none') addImgPlaceholder(msg.id, msg.name);   // 触发即占位（正在生成图…）
+    if (channel !== 'none') addImgPlaceholder(lock.el, msg.name);   // 触发即占位（绑在该楼层，消息快也不消失）
     if (channel === 'st') {
         // 无桥模式总开关（本地存储）：关闭时跳过并提示
         if ((taGetLocalCfg().enabled ?? true) === false) {
@@ -2109,7 +2147,8 @@ async function triggerOnce(msg, overrideText) {
             return;
         }
         try {
-            await generateViaST(text, msg.name || '角色');
+            // 任务锁已在上方构建（含楼层锚 el）
+            await generateViaST(text, msg.name || '角色', lock);
         } catch (e) {
             // 被中断（重roll/编辑/急停）→ 静默，不弹红框
             if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')))) {
@@ -2207,8 +2246,11 @@ function taBindSendMonitor() {
                         const domName = $mes.length ? ($mes.attr('ch_name') || '') : '';
                         console.log('[ta-img][diag] 触发目标：', (domName || '?'), '| 网页文本头=', String(domText).slice(0, 60).replace(/\n/g, ' '), '| domLen=', domText.length);
                         const last = c && c.chat ? c.chat[c.chat.length - 1] : null;
-                        if (last && !last.is_user && !last.is_system) triggerOnce(last, domText);
-                        else if (domText && domName) triggerOnce({ name: domName, mes: domText, is_user: false }, domText);
+                        // 楼层锚：抓住这一层 .mes 元素本身（出图后原地放图，与楼层绑定定死）
+                        const elLock = $mes.length ? $mes[0] : null;
+                        console.log('[ta-img][diag] 楼层锚=', elLock ? ('#mes 元素已捕获 isConnected=' + elLock.isConnected) : 'null');
+                        if (last && !last.is_user && !last.is_system) triggerOnce(last, domText, { el: elLock });
+                        else if (domText && domName) triggerOnce({ name: domName, mes: domText, is_user: false }, domText, { el: elLock });
                     } catch (e) { /* 忽略 */ }
                 }, 300);
             } catch (e) { /* 忽略 */ }

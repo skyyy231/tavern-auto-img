@@ -1034,16 +1034,31 @@ function connect() {
 
 // ── 桥未启动引导：控制台顶部显示一键安装 ──
 let bridgeHelpShown = false;
-function showBridgeHelp() {
+async function getMyExtInfo() {
+    // 问酒馆服务器：扩展管理器 discover 接口返回扩展清单 [{type,name}]
+    try {
+        const r = await fetch('/api/extensions/discover');
+        const list = await r.json();
+        const mine = (Array.isArray(list) ? list : []).find(x => /tavern-auto-img/i.test(x.name || ''));
+        if (mine) {
+            if (mine.type === 'local') return `酒馆目录/data/default-user/extensions/${mine.name.replace(/^third-party\//, '')}`;
+            if (mine.type === 'global') return `酒馆目录/public/scripts/extensions/${mine.name}`;
+            return `酒馆目录/public/scripts/extensions/${mine.name}`;
+        }
+    } catch (e) { /* 忽略 */ }
+    return '酒馆目录/data/default-user/extensions/tavern-auto-img-extension';
+}
+async function showBridgeHelp() {
     bridgeHelpShown = true;
     const $h = $('#ta-img-bridge-help');
     if (!$h.length) {
+        const myDir = await getMyExtInfo();
         $('<div id="ta-img-bridge-help" style="background:rgba(224,85,85,.10);border:1px solid rgba(224,85,85,.45);border-radius:12px;padding:12px 14px;margin-bottom:10px;font-size:16px;color:#ffb4b4;">' +
           '<div style="font-weight:700;margin-bottom:6px;">⚠️ 桥未启动（出图功能不可用）</div>' +
           '<div style="margin-bottom:8px;line-height:1.7;">桥 = 发动机，随酒馆自动运行。没检测到它可能还没安装：</div>' +
           '<ol style="margin:0 0 8px 18px;line-height:1.7;">' +
-          '<li>桥文件已随本扩展下载好了（扩展目录 bridge/ 里）</li>' +
-          '<li>打开扩展文件夹里的 <b>install.bat</b> 双击（即本项目仓库根目录，随安装下载的），它会自动：复制桥到 plugins/ + 开开关 + 问你要不要重启酒馆</li>' +
+          '<li>桥文件和 install.bat 已随本扩展下载，位置：<br><b style="color:#7dd3fc;word-break:break-all;">' + myDir + '</b></li>' +
+          '<li>打开那个文件夹 → 双击 <b>install.bat</b>（自动：复制桥到 plugins/ + 开开关 + 问你要不要重启酒馆）</li>' +
           '<li>完成后强刷本页面，这条提示自动消失</li>' +
           '</ol>' +
           '</div>').insertAfter($('#ta-img-card .list-group-item').first());

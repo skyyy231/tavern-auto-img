@@ -548,6 +548,25 @@ const server = http.createServer(async (req, res) => {
                 saveState();
                 return jsonReply(res, { ok: true, ...ST });
             }
+            if (p === '/open-dir') {
+                try {
+                    const cwd0 = process.cwd();
+                    const ourExt = [
+                        path.join(cwd0, 'data', 'default-user', 'extensions', 'tavern-auto-img-extension'),
+                        path.join(cwd0, 'data', 'default-user', 'extensions', 'TavernAutoImage'),
+                        path.join(cwd0, 'public', 'scripts', 'extensions', 'third-party', 'tavern-auto-img'),
+                    ].find(p0 => fs.existsSync(p0));
+                    const userExtDir = path.join(cwd0, 'data', 'default-user', 'extensions');
+                    const globalExtDir = path.join(cwd0, 'public', 'scripts', 'extensions', 'third-party');
+                    const d = ourExt || (fs.existsSync(globalExtDir) ? globalExtDir : userExtDir);
+                    if (process.platform === 'win32') {
+                        const { spawn } = await import('node:child_process');
+                        const ch = spawn('explorer.exe', [d], { detached: true, stdio: 'ignore' });
+                        ch.unref();
+                    }
+                    return jsonReply(res, { ok: true, dir: d });
+                } catch (e) { return jsonReply(res, { ok: false, error: String(e.message || e) }); }
+            }
             if (p === '/cancel') {
                 cancelFlag = true;
                 if (currentProc && !currentProc.killed) { try { currentProc.kill(); } catch { /* 忽略 */ } }

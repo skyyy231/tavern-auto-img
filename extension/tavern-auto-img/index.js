@@ -170,6 +170,7 @@ async function stEngineer(text, family) {
     const j = await r.json();
     if (!r.ok) throw new Error(String(j?.error?.message || 'LLM 调用失败 ' + r.status));
     const content = j?.choices?.[0]?.message?.content || '';
+    console.log('[ta-img][diag] 提示词返回：content长度=', content.length, '| 前80字=', content.slice(0, 80).replace(/\n/g, ' '));
     try {
         const m = content.match(/\{[\s\S]*\}/);
         const p = JSON.parse(m ? m[0] : content);
@@ -214,9 +215,12 @@ async function stPreflight(family, comfyUrl) {
 async function generateViaST(text, name) {
     console.log('[ta-img][st] ① 进入无桥出图', { textLen: (text || '').length, name });
     const localCfg = taGetLocalCfg();
+    const runStart = Date.now();
+    taLogRun({ channel: '🟢 无桥(ST代理)', model: '', family: '', positive: '', negative: '', status: '⏳ 进行中' });
     let modelFile = (autoModelSel?.val() || '').trim() || (modelSel?.val() || '').trim();
     if (!modelFile) modelFile = (localCfg.auto_model || '').trim();   // 面板未加载时从本地兜底
     const family = modelFile ? stDetectFamily(modelFile) : 'anima';
+    taLogRun({ model: modelFile, family: family });
     // LoRA：面板勾选优先；无勾选时用无桥手动清单（localStorage）
     let loras = loraBox ? Array.from(loraBox.find('input[type=checkbox]:checked')).map(c => c.getAttribute('data-file') || '') : [];
     if (!loras.length && Array.isArray(localCfg.loras)) loras = localCfg.loras;
@@ -230,6 +234,7 @@ async function generateViaST(text, name) {
     const pr = await stEngineer(text, family).catch(e => { throw new Error('提示词生成失败:' + e.message); });
     const negative = 'bad quality, worst quality, lowres, blurry, extra limbs, deformed hands, text, watermark'
         + (pr.male ? ', female, woman, girl, big breasts, cleavage, westerner, caucasian' : '');
+    taLogRun({ positive: pr.positive, negative: negative, promptOk: true });
     toastr.info('✅ 提示词完成，开始生图…', '自动文生图');
 
     // 自定义工作流优先：已启用且粘贴了 API JSON → 替换占位符后直接用（模型/参数由 JSON 决定）
@@ -261,6 +266,7 @@ async function generateViaST(text, name) {
     const fname = 'tavern_auto_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     const url = await saveBase64AsFile(result.data, (name || '生图').replace(/[\\/]/g, '_'), fname, fmt);
     console.log('[ta-img][st] ⑦ 上传成功，url =', url);
+    taLogRun({ status: '✅ 成功', secs: Math.round((Date.now() - runStart) / 1000), url: url }, true);
     showImage({ url: url, name: name, model: modelFile });
     console.log('[ta-img][st] ⑧ showImage 调用完成');
     return url;
@@ -289,9 +295,10 @@ function injectTaSpinKeyframes() {
     taSpinInjected = true;
     $('head').append('<style>@keyframes taSpin{to{transform:rotate(360deg)}}.ta-img-ph{display:flex;align-items:center;gap:12px;width:fit-content;min-width:260px;max-width:480px;margin:6px 0 10px;padding:12px 16px;border-radius:12px;background:rgba(255,255,255,.04);border:1px dashed rgba(255,255,255,.3);color:#aeb4c6;font-size:15px}.ta-img-spin{width:20px;height:20px;border:3px solid rgba(255,255,255,.18);border-top-color:#818cf8;border-radius:50%;animation:taSpin 1s linear infinite;flex-shrink:0}.ta-img-done{margin:6px 0 10px;border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,.12);display:inline-block;max-width:480px;background:rgba(255,255,255,.03)}.ta-img-done img{display:block;max-width:480px;width:100%;height:auto;border-radius:12px;}</style>');
 }
-function addImgPlaceholder(msgId) {
+function addImgPlaceholder(msgId, msgName) {
     let $el = msgId ? $('.mes[mesid="' + msgId + '"]') : $();
-    if (!$el.length) $el = $('.mes').last();          // 消息无 id/未渲染：兜底挂最后一条消息下
+    if (!$el.length && msgName) $el = $('.mes[ch_name="' + msgName + '"]').last();   // 按角色名找本次回复
+    if (!$el.length) $el = $('.mes[is_user="false"]').last();
     if (!$el.length) return;                          // 聊天区无消息：跳过（不阻断出图）
     if ($el.find('.ta-img-ph').length) return;        // 已有占位不重复
     injectTaSpinKeyframes();
@@ -309,16 +316,54 @@ function addImgPlaceholder(msgId) {
 function replaceImgPlaceholder(url) {
     const $p = $('.ta-img-ph').first();
     if (!$p.length) return false;
-    injectTaSpinKeyframes();
-    $p.replaceWith('<div class="ta-img-done"><img src="' + url + '" alt="生成图" onerror="this.parentElement.remove();"></div>');
+    // 占位符只负责"加载中"提示；成品图统一走 ST 官方媒体渲染（避免与官方媒体重复显示两份）
+    $p.remove();
     return true;
 }
 function removeImgPlaceholder() {
     $('.ta-img-ph').remove();
 }
 
+// 出图运行日志：每次触发记录（提示词/模型/耗时/结果），localStorage 滚动 50 条，面板可查
+let taCurrentRun = null;
+function taLogRun(partial, finalize) {
+    try {
+        if (!taCurrentRun) taCurrentRun = { ts: new Date().toLocaleTimeString('zh-CN', { hour12: false }), steps: [] };
+        Object.assign(taCurrentRun, partial);
+        if (finalize) {
+            const arr = JSON.parse(localStorage.getItem('taImgRunLogs') || '[]');
+            arr.unshift(taCurrentRun);
+            if (arr.length > 50) arr.length = 50;
+            localStorage.setItem('taImgRunLogs', JSON.stringify(arr));
+            taCurrentRun = null;
+        }
+    } catch (e) { /* 忽略 */ }
+}
+function taGetRunLogs() {
+    try { return JSON.parse(localStorage.getItem('taImgRunLogs') || '[]'); } catch (e) { return []; }
+}
+
+// 中断当前出图任务（包括提示词 LLM 与 ComfyUI 排队/生成中的任务）
+async function taInterruptImageTask() {
+    try {
+        // ① 无桥：中止前端 fetch（提示词/代理请求立即停）
+        if (stAbort && !stAbort.signal.aborted) {
+            try { stAbort.abort(); } catch (e) { /* 忽略 */ }
+        }
+        // ② 真中断 ComfyUI 任务：直连 /interrupt（ComfyUI 已开 CORS）
+        const comfyUrl = ((document.getElementById('tavern-img-comfy')?.value || '').trim() || (taGetLocalCfg().comfy_url || 'http://127.0.0.1:8188')).replace(/\/+$/, '');
+        try { await fetch(comfyUrl + '/interrupt', { method: 'POST', signal: AbortSignal.timeout(3000) }); } catch (e) { /* ComfyUI 未起/拒绝即忽略 */ }
+        // ③ 桥模式：桥端移除队列任务
+        if (connected) {
+            try { await fetch(BRIDGE + '/cancel', { method: 'POST' }); } catch (e) { /* 忽略 */ }
+        }
+        console.log('[tavern-auto-img] 已触发中断（重roll/编辑）');
+    } catch (e) { /* 忽略 */ }
+}
+
 // 已显示过的图片 url（防重复投递/重复连接导致重复消息）
 const shownImages = new Set();
+
 
 function showImage(data) {
     try {
@@ -354,11 +399,11 @@ function showImage(data) {
             if (!target.extra.media.some(x => x.url === url)) {
                 target.extra.media.push({ url: url, type: 'image', title: data.model || '' });
                 let $el = $('.mes[mesid="' + target.id + '"]');
-                if (!$el.length) $el = $('.mes').last();   // 无 id/未渲染：挂最后一条回复下
-                if ($el.length && !replaced) {
-                    try { appendMediaToMessage(target, $el, 'keep'); } catch (e2) { console.warn('[tavern-auto-img] 追加媒体渲染失败:', e2); }
-                } else if ($el.length && replaced) {
-                    // 已用 DOM 大图替换占位：数据保留（刷新/滚动后仍显示），不重复渲染列表
+                if (!$el.length && target.name) $el = $('.mes[ch_name="' + target.name + '"]').last();   // 无 id：按角色名找本次回复
+                if (!$el.length) $el = $('.mes[is_user="false"]').last();   // 最后兜底：最后一条角色回复
+                console.log('[ta-img][diag] showImage 挂载目标=', target.id, '| replaced=', replaced, '| elLen=', $el.length, '| 消息名=', target.name || '', '| chat 最后=', (getCtx()?.chat?.length ?? -1));
+                if ($el.length) {
+                    try { appendMediaToMessage(target, $el, 'keep'); console.log('[ta-img][diag] appendMediaToMessage 完成（replaced=' + replaced + '）'); } catch (e2) { console.warn('[tavern-auto-img] 追加媒体渲染失败:', e2); }
                 } else {
                     // 虚拟滚动：目标消息不在渲染池 → 滚到底触发渲染后重试一次
                     console.info('[tavern-auto-img] 目标消息未渲染，滚动重试…', target.id);
@@ -1785,6 +1830,7 @@ function buildPanelUI($host) {
     const $rowAux = $('<div class="list-group-item" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:4px 14px 0;padding:10px 14px;border-radius:12px;background:rgba(125,211,252,.05);border:1px solid rgba(125,211,252,.18);"></div>');
     $rowAux.append('<span id="ta-img-open-dir2" title="打开扩展文件夹（install.bat / 桥文件所在）" style="cursor:pointer;font-size:15px;color:#7dd3fc;padding:5px 12px;border-radius:8px;border:1px solid rgba(125,211,252,.4);white-space:nowrap;flex-shrink:0;">📂 扩展目录</span>');
     $rowAux.append('<span id="ta-img-uninstall2" title="卸载自动文生图桥（关闭出图引擎）&#10;&#10;点击后：&#10;① 删除酒馆 plugins 里的桥文件&#10;② 关闭 config.yaml 的 enableServerPlugins&#10;③ 自动重启酒馆。&#10;&#10;扩展本体保留不删；重新启用 = 运行扩展目录里的 install.bat。" style="cursor:pointer;font-size:15px;color:#f87171;padding:5px 12px;border-radius:8px;border:1px solid rgba(248,113,113,.4);white-space:nowrap;flex-shrink:0;">🧹 卸载桥</span>');
+    $rowAux.append('<span id="ta-img-log2" title="查看最近出图运行日志（含提示词/模型/耗时/错误）" style="cursor:pointer;font-size:15px;color:#34d399;padding:5px 12px;border-radius:8px;border:1px solid rgba(52,211,153,.4);white-space:nowrap;flex-shrink:0;">📋 出图日志</span>');
     $rowAux.append('<span id="ta-img-guide2" title="桥安装指南：桥=增强引擎（可选）" style="cursor:pointer;font-size:15px;color:#fbbf24;padding:5px 12px;border-radius:8px;border:1px solid rgba(251,191,36,.4);white-space:nowrap;flex-shrink:0;">❓ 桥安装指南</span>');
     $rowAux.on('click', '#ta-img-open-dir2', async function () {
         try {
@@ -1832,7 +1878,27 @@ function buildPanelUI($host) {
         await renderGuideCard();
         $guideBox.toggle();
     });
-    $panel.append($guideBox);
+    // 出图日志卡（点 📋 展开最近 10 条：时间/通道/模型/家族/提示词/耗时/错误）
+    const $logBox = $('<div id="ta-img-log-box" style="display:none;margin:8px 14px 0;padding:12px 14px;border-radius:12px;background:rgba(52,211,153,.06);border:1px solid rgba(52,211,153,.25);font-size:14px;line-height:1.7;color:#d1fae5;max-height:340px;overflow:auto;"></div>');
+    function renderLogBox() {
+        const logs = taGetRunLogs();
+        if (!logs.length) { $logBox.html('<div style="color:rgba(230,230,242,.6);">暂无出图记录（发消息触发一次后这里会有日志）</div>'); return; }
+        $logBox.html(logs.slice(0, 10).map((l, i) => {
+            const p = l.positive || '';
+            return '<div style="margin-bottom:12px;padding:8px 10px;border-radius:10px;background:rgba(0,0,0,.25);">' +
+                `<div style="color:#34d399;">#${logs.length - i}　${l.ts || ''}　${l.channel || ''}　${l.status || ''}${l.secs != null ? '（' + l.secs + 's）' : ''}</div>` +
+                `<div style="color:#9aa;">模型：${l.model || '未选(自动兜底)'}　家族：${l.family || '-'}</div>` +
+                (p ? `<div style="margin-top:4px;color:#e8e8f2;word-break:break-all;"><b>正向提示词：</b>${p}</div>` : '') +
+                (l.negative ? `<div style="color:rgba(230,230,242,.55);word-break:break-all;"><b>负向：</b>${l.negative.slice(0, 180)}${l.negative.length > 180 ? '…' : ''}</div>` : '') +
+                (l.error ? `<div style="color:#f87171;word-break:break-all;"><b>错误：</b>${l.error}</div>` : '') +
+                '</div>';
+        }).join(''));
+    }
+    $rowAux.on('click', '#ta-img-log2', function () {
+        renderLogBox();
+        $logBox.toggle();
+    });
+    $panel.append($logBox);
 
     // 状态行（当前通道 + 模型数）：置于面板最上面（用户要求）——胶囊样式更醒目
     const $rowMode = $('<div class="list-group-item flex-container flexGap5" style="align-items:center;flex-wrap:wrap;margin:12px 14px 4px;padding:10px 14px;border-radius:12px;background:rgba(139,195,74,.06);border:1px solid rgba(139,195,74,.25);"></div>');
@@ -1853,7 +1919,7 @@ function buildPanelUI($host) {
 
     // 按用户指定顺序重排（DOM 移动，不影响引用）：
     // 状态行置顶 → 总开关 → 简要指南 → 模型/LoRA目录 → 服务配置和API → 模型选择 → LoRA选择 → 速度档位；提示词规则置底；辅助行+指南卡
-    [$rowMode, $stopRow, $rowHelp, $rowPaths, $rowCfg, $rowLLM, $rowAuto, $rowLora, $rowSpeed, $rowPrompt, $rowWf, $rowModel, $rowAux, $guideBox]
+    [$rowMode, $stopRow, $rowHelp, $rowPaths, $rowCfg, $rowLLM, $rowAuto, $rowLora, $rowSpeed, $rowPrompt, $rowWf, $rowModel, $rowAux, $guideBox, $logBox]
         .forEach(x => { if (x) $panel.append(x); });
 
     loadModelOptions();
@@ -1979,31 +2045,63 @@ async function showBridgeHelp() {
 // ── v3 事件触发：角色回复完成 → 提示词工程 → 出图 ──────────────
 const seenMessages = new Set();  // 已触发过（防重）
 let autoGenTimer = null;
+let taAllowTrigger = false;      // 用户消息门闩：只有用户发过消息后才允许出图（切卡=锁，防历史加载自动出图）
+let taChatChangedAt = Date.now(); // 最近一次切卡/加载时间（5 秒窗口内渲染的用户消息=历史加载，不解锁）
+let taLastUserSentDate = '';      // 最近一条用户消息 send_date（回复须晚于它；历史/开场白早于它→拦）
+
+// 是否开场白/首条角色消息（ST 开场白 = chat 第一条角色消息；用户明确：开场白不出图）
+function isFirstMessage(msg) {
+    try {
+        const c = getCtx();
+        if (!c || !c.chat || !c.chat.length) return false;
+        if (msg && c.chat[0] === msg && !msg.is_user) return true;        // 第一条角色消息=开场白（无论 chat 多长）
+        if (c.chat.length === 1 && msg && !msg.is_user) return true;
+        if (msg && msg.extra && msg.extra.type === 'first_message') return true;
+        return false;
+    } catch (e) { return false; }
+}
 
 function getCtx() {
     try { return window.SillyTavern.getContext(); } catch (e) { return null; }
 }
 
-async function triggerOnce(msg) {
+async function triggerOnce(msg, overrideText) {
     const ctx = getCtx();
-    // 从 chat 里取当前消息（防重已按 id 处理；用 ctx.chat 找最近一条）
-    const isRecent = ctx && ctx.chat && ctx.chat.length && (ctx.chat[ctx.chat.length - 1].id === msg.id);
+    // 从 chat 里取当前消息（ST 消息无 id → 用对象引用/send_date 判定最近一条）
+    const last = ctx && ctx.chat && ctx.chat.length ? ctx.chat[ctx.chat.length - 1] : null;
+    const isRecent = !!(last && (last === msg || (last.send_date && msg.send_date && last.send_date === msg.send_date) || overrideText));
     // 只处理角色回复：非用户、非系统（我们自己的"已生成图片"就是系统消息）
     if (!isRecent) return;
     if (msg.is_user || msg.is_system) return;
-    if (seenMessages.has(msg.id)) return;
-    seenMessages.add(msg.id);
+    // 开场白（first_message）不出图：用户明确视为 bug
+    if (isFirstMessage(msg)) {
+        console.log('[tavern-auto-img] 开场白/首条角色消息，跳过出图');
+        return;
+    }
+    // 用户消息门闩：未发过消息（切卡历史加载/直接看卡）→ 一律不出图
+    if (!taAllowTrigger) {
+        console.log('[tavern-auto-img] 尚未发送用户消息（门闩锁），跳过');
+        return;
+    }
+    // 生成未完成防"半截"：回复应晚于最近用户消息（历史/开场白早于用户消息 → 拦）；文本稳定由防抖保证
+    if (taLastUserSentDate && msg.send_date && String(msg.send_date) < String(taLastUserSentDate)) {
+        console.log('[tavern-auto-img] 早于最近用户消息（历史/开场白），跳过');
+        return;
+    }
+    const seenKey = String(msg.send_date || msg.id || '') + '|' + String((msg.mes || '').length);
+    if (seenMessages.has(seenKey)) return;
+    seenMessages.add(seenKey);
     pendingImgTarget = msg;   // 图片附加到这条角色回复下方（桥/无桥两端都设）
     if (seenMessages.size > 100) {
         const first = seenMessages.values().next().value;
         seenMessages.delete(first);
     }
-    const text = (msg.mes || msg.message || '').trim();
+    const text = String(overrideText || msg.mes || msg.message || '').trim();
     if (!text) return;
-    console.log('[tavern-auto-img] 收到角色回复, 触发自动文生图, id=', msg.id);
+    console.log('[tavern-auto-img] 收到角色回复, 触发自动文生图, id=', msg.id, 'send_date=', msg.send_date);
     // 通道选择：桥活着 → 桥；桥没起 → ST 原生代理（无桥模式）；都没有 → 提示装桥
     const channel = await detectChannel();
-    if (channel !== 'none') addImgPlaceholder(msg.id);   // 触发即占位（正在生成图…）
+    if (channel !== 'none') addImgPlaceholder(msg.id, msg.name);   // 触发即占位（正在生成图…）
     if (channel === 'st') {
         // 无桥模式总开关（本地存储）：关闭时跳过并提示
         if ((taGetLocalCfg().enabled ?? true) === false) {
@@ -2013,7 +2111,15 @@ async function triggerOnce(msg) {
         try {
             await generateViaST(text, msg.name || '角色');
         } catch (e) {
+            // 被中断（重roll/编辑/急停）→ 静默，不弹红框
+            if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')))) {
+                removeImgPlaceholder();
+                taLogRun({ status: '⏹ 已中断', error: '用户重roll/编辑/急停' }, true);
+                console.info('[tavern-auto-img] 任务已中断（用户重roll/编辑）');
+                return;
+            }
             console.error('[tavern-auto-img] 无桥模式失败:', e);
+            taLogRun({ status: '❌ 失败', secs: 0, error: (e?.message || '未知错误') }, true);
             const stack = (e && e.stack ? e.stack.split('\n').slice(0, 4).map(s => s.trim()).join(' ← ') : (e?.message || '未知错误'));
             showError({ message: (e?.message || '无桥模式出图失败') + ' | ' + stack });
         }
@@ -2049,25 +2155,101 @@ async function triggerOnce(msg) {
     }
 }
 
+// 监听发送按钮状态（用户方案：单点状态机）
+// ① 纸飞机点击/Enter = 用户发送 → 门闩解锁
+// ② 圆圈(#mes_stop)点击 = 用户急停 → 中断图任务
+// ③ 圆圈→纸飞机（生成完成） = 出图触发信号（唯一触发点）
+function taBindSendMonitor() {
+    if (window.__taSendBound) return;
+    const $sb = $('#send_but');
+    if (!$sb || !$sb.length) { setTimeout(taBindSendMonitor, 800); return; }
+    const $ms = $('#mes_stop');
+    const unlock = function () {
+        setTimeout(() => {
+            try {
+                if (!taAllowTrigger) {
+                    taAllowTrigger = true;
+                    const c0 = getCtx();
+                    if (c0 && c0.chat) {
+                        const usr = [...c0.chat].reverse().find(m => m && m.is_user);
+                        if (usr) taLastUserSentDate = usr.send_date || '';
+                    }
+                    console.log('[ta-img][diag] 发送按钮/Enter 检测 → 门闩解锁');
+                }
+            } catch (e) { /* 忽略 */ }
+        }, 150);
+    };
+    $sb.on('click', unlock);
+    const $ta = $('#send_textarea');
+    if ($ta.length) $ta.on('keydown', function (e) { if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey) unlock(); });
+    // 用户点"圆圈"（急停）→ 中断图任务（ST 自己停止生成；我们同步停图）
+    if ($ms && $ms.length) {
+        $ms.on('click', function () {
+            console.log('[ta-img][diag] 急停按钮被点击 → 中断图任务');
+            taInterruptImageTask();
+            removeImgPlaceholder();
+        });
+    }
+    // 完成检测：生成中 #mes_stop（圆圈）display:flex；完成后 display:none（圆消失=回到纸飞机态）→ 唯一出图触发点
+    const isStopVisible = function () { return $ms.length && $ms.css('display') !== 'none'; };
+    const mo = new MutationObserver(function () {
+        const nowV = isStopVisible();
+        if (prevStopVisible && !nowV) {
+            console.log('[ta-img][diag] 圆圈消失（生成完成）→ 300ms 后抓网页文本出图');
+            try {
+                if (autoGenTimer) clearTimeout(autoGenTimer);
+                autoGenTimer = setTimeout(function () {
+                    try {
+                        const c = getCtx();
+                        // 直接从网页抓最新角色回复文本（DOM=用户所见；不赌 chat 数组时序）
+                        const $mes = $('.mes[is_user="false"]').last();
+                        const domText = $mes.length ? ($mes.find('.mes_text').text() || '').trim() : '';
+                        const domName = $mes.length ? ($mes.attr('ch_name') || '') : '';
+                        console.log('[ta-img][diag] 触发目标：', (domName || '?'), '| 网页文本头=', String(domText).slice(0, 60).replace(/\n/g, ' '), '| domLen=', domText.length);
+                        const last = c && c.chat ? c.chat[c.chat.length - 1] : null;
+                        if (last && !last.is_user && !last.is_system) triggerOnce(last, domText);
+                        else if (domText && domName) triggerOnce({ name: domName, mes: domText, is_user: false }, domText);
+                    } catch (e) { /* 忽略 */ }
+                }, 300);
+            } catch (e) { /* 忽略 */ }
+        }
+        prevStopVisible = nowV;
+    });
+    let prevStopVisible = isStopVisible();
+    if ($ms && $ms.length) mo.observe($ms[0], { attributes: true, attributeFilter: ['style', 'class'] });
+    window.__taSendBound = true;
+    console.log('[ta-img][diag] 生成状态监控已绑定（#mes_stop 圆圈显示/消失）');
+}
+
 function bindMessageEvents() {
     // 重试等待 ST 就绪（getContext 可能未就绪）；绑定后即插即用
     let tries = 0;
     const tryBind = function () {
         const ctx = getCtx();
         if (ctx && ctx.eventSource) {
-            ctx.eventSource.on('message_received', function () {
-                try {
-                    const c = getCtx();
-                    if (!c || !c.chat || !c.chat.length) return;
-                    const last = c.chat[c.chat.length - 1];
-                    if (last && !last.is_user && !last.is_system) {
-                        if (autoGenTimer) clearTimeout(autoGenTimer);
-                        autoGenTimer = setTimeout(() => triggerOnce(last), 3000);
-                        console.log('[tavern-auto-img] message_received, 3s 后触发, id=', last.id);
-                    }
-                } catch (e) { /* 忽略 */ }
+            // 用户消息门闩解锁：已全部改由发送按钮监控（taBindSendMonitor）；
+            // 仅保留切换/中断类监听（图任务状态管理）
+            // 切换角色/聊天时：锁门闩+重置观察基线+防重记录（防历史加载/别的聊天误触发出图）
+            ctx.eventSource.on('chat_id_changed', function () {
+                taAllowTrigger = false;
+                taChatChangedAt = Date.now();
+                taLastUserSentDate = '';
+                window.__taImgLastKey = '';
+                seenMessages.clear();
+                removeImgPlaceholder();
             });
-            console.log('[tavern-auto-img] 已绑定 message_received 事件');
+            // 重 roll / 滑动 / 编辑消息 → 立即中断正在生成的图任务（含提示词 LLM）
+            ctx.eventSource.on('message_swiped', function (msgId) {
+                taInterruptImageTask();
+                removeImgPlaceholder();
+                taAllowTrigger = true;   // 重 roll 属于"已激活的会话"：保持解锁（已切卡则被 chat_id_changed 锁）
+                console.log('[ta-img][diag] message_swiped → 中断+解锁重出图, id=', msgId);
+            });
+            ctx.eventSource.on('message_edited', function () {
+                taInterruptImageTask();
+                removeImgPlaceholder();
+            });
+            console.log('[ta-img][diag] 事件监听已切换（触发=发送按钮状态机）');
             const $bs = $('#ta-img-bind');
             if ($bs.length) {
                 $bs.html('<span style="display:inline-flex;align-items:center;gap:6px;"><span style="width:8px;height:8px;border-radius:50%;background:#8bc34a;box-shadow:0 0 8px #8bc34a;animation:pulse 1.6s infinite;"></span>✅ 已绑定 · 自动出图</span>');
@@ -2107,6 +2289,7 @@ function init() {
     buildSettingsUI();        // 设置区只留"打开控制台"入口
     connect();
     setTimeout(bindMessageEvents, 1500);  // 等 ST 就绪再绑
+    setTimeout(taBindSendMonitor, 1500);  // 发送按钮监控（门闩解锁）
 }
 
 // 页面错误捕手：任何未捕获 JS 错误 → 控制台红条显示（方便定位，无需 F12）

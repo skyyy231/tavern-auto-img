@@ -117,8 +117,8 @@ async function comfyView(fname, subfolder, type) {
 // ── 家族识别 + 标准工作流构建（只用内置节点）──
 const FAMILY_RULES = [
     [['anima', 'unholy', 'hassaku', 'nova', 'miaomiao', 'anima29', 'turbo'], 'anima'],
-    [['krea2', 'gonzalomo', 'moody', 'z_image', 'zit', 'zimage'], 'krea2'],
-    [['flux', 'dev'], 'flux'],
+    [['krea2', 'gonzalomo', 'moody'], 'krea2'],
+    [['flux', 'dev', 'z_image', 'zimage', 'zit'], 'flux'],
     [['kodoranime'], 'sdxl'],
 ];
 const CP_HINTS = ['kodoranime', 'unrealvision', 'sdxl', 'pony', 'illustrious', 'anything'];
@@ -194,6 +194,19 @@ function buildWorkflow(modelFile, family, loras, sizeMult, stepsMult, prompt, ne
     return wf;
 }
 
+let listsCache = { ts: 0, clips: [], vaes: [] };
+async function comfyLists(force) {
+    if (!force && Date.now() - listsCache.ts < 120000 && listsCache.clips.length) return listsCache;
+    const clips = [], vaes = [];
+    try {
+        const oi = await comfyGet('/object_info');
+        clips.push(...(oi['CLIPLoader']?.input?.required?.clip_name?.[0] || []));
+        vaes.push(...(oi['VAELoader']?.input?.required?.vae_name?.[0] || []));
+    } catch (e) { log('[enum] CLIP/VAE 枚举失败', e.message); }
+    listsCache = { ts: Date.now(), clips, vaes };
+    return listsCache;
+}
+
 // ── 模型/LoRA 枚举（object_info）──
 let autoModelsCache = { ts: 0, list: [] };
 async function autoModels(force) {
@@ -207,7 +220,7 @@ async function autoModels(force) {
             const items = def?.input?.required?.[cls === 'UNETLoader' ? 'unet_name' : 'ckpt_name']?.[0] || [];
             for (const f of items) {
                 if (typeof f !== 'string' || f.includes('put_') || f.startsWith('.')) continue;
-                list.push({ file: f, family: detectFamily(f), label: (f.includes('unholy') || f.includes('hassaku') || f.includes('nova') || f.includes('miaomiao')) ? '动漫-Anima — ' + f : f });
+                list.push({ file: f, family: detectFamily(f), kind: cls === 'CheckpointLoaderSimple' ? 'ckpt' : 'unet', label: (f.includes('unholy') || f.includes('hassaku') || f.includes('nova') || f.includes('miaomiao')) ? '动漫-Anima — ' + f : f });
             }
         }
     } catch (e) { log('[enum] 模型枚举失败', e.message); }
@@ -323,6 +336,9 @@ async function runJob(job) {
             if (model_file) { st.auto_model = model_file; st.family = detectFamily(model_file); saveState(); }
         }
         if (!model_file) throw new Error('未选择模型（请在面板④ 模型选择 里选一个）');
+        // 动态判定：模型在 ComfyUI checkpoint 枚举里 → 用通用 checkpoint 模式（自带 CLIP/VAE，任何这类模型都稳）
+        const amInfo = (await autoModels(false)).find(m => m.file === model_file);
+        if (amInfo && amInfo.kind === 'ckpt') st.family = 'sdxl';
         const family = st.family || detectFamily(model_file);
         broadcast({ type: 'stage', stage: 'engineer', msg: '🤖 提示词生成中…' });
         const pr = await engineer(job.text, family);
@@ -338,6 +354,13 @@ async function runJob(job) {
             log('[gen] 使用自定义工作流', Object.keys(wf).length, '节点');
         } else {
             const lorasList = (st.loras || []).map(f => [f, 0.8, 0.8]);
+            const rec = RECIPES[family] || RECIPES['anima'];
+            if (!rec.checkpoint) {
+                const L = await comfyLists(false);
+                const needClip = rec.dual ? [rec.clip2, rec.clip[0]] : [rec.clip[0]];
+                const missing = [...needClip.filter(c => !L.clips.includes(c)), ...(!L.vaes.includes(rec.vae) ? [rec.vae] : [])];
+                if (missing.length) throw new Error(`模型族「${family}」依赖文件缺失（ComfyUI 未枚举到）：${missing.join('、')}。请把缺少的文件放入 models/text_encoders 或 models/vae，或在 ComfyUI 安装支持包`);
+            }
             wf = buildWorkflow(model_file, family, lorasList, st.size_mult, st.steps_mult, pr.positive, negative);
         }
         const clientId = crypto.randomUUID();

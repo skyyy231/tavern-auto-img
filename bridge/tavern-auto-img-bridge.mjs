@@ -129,9 +129,9 @@ function detectFamily(file) {
     return 'anima';
 }
 const RECIPES = {
-    anima: { clip: ['qwen_image', 'qwen_image'], vae: 'qwen_image-vae.safetensors', latent: ['EmptySD3LatentImage', 16], sampler: 'euler', scheduler: 'simple', steps: 20, cfg: 4.0, width: 512, height: 768 },
-    krea2: { clip: ['krea2', 'krea2'], vae: 'qwen_image-vae.safetensors', latent: ['EmptySD3LatentImage', 16], sampler: 'er_sde', scheduler: 'simple', steps: 8, cfg: 1.0, width: 832, height: 1216 },
-    flux: { clip: ['t5xxl_fp8_e4m3fn', 'flux'], vae: 'flux-vae-bf16.safetensors', latent: ['EmptySD3LatentImage', 16], sampler: 'euler', scheduler: 'simple', steps: 20, cfg: 1.0, width: 832, height: 1216, dual: true, clip2: 'clip_l.safetensors' },
+    anima: { clip: ['miaomiaoHarem_anima16_txt.safetensors', 'qwen_image'], vae: 'qwen_image-vae.safetensors', latent: ['EmptySD3LatentImage', 16], sampler: 'euler', scheduler: 'simple', steps: 20, cfg: 4.0, width: 512, height: 768 },
+    krea2: { clip: ['gonzalomoKrea2_v40_txt.safetensors', 'krea2'], vae: 'qwen_image-vae.safetensors', latent: ['EmptySD3LatentImage', 16], sampler: 'er_sde', scheduler: 'simple', steps: 8, cfg: 1.0, width: 832, height: 1216 },
+    flux: { clip: ['t5xxl_fp8_e4m3fn.safetensors', 'flux'], vae: 'flux-vae-bf16.safetensors', latent: ['EmptySD3LatentImage', 16], sampler: 'euler', scheduler: 'simple', steps: 20, cfg: 1.0, width: 832, height: 1216, dual: true, clip2: 'clip_l.safetensors' },
     sdxl: { checkpoint: true, latent: ['EmptyLatentImage', 4], sampler: 'euler', scheduler: 'normal', steps: 20, cfg: 7.0, width: 512, height: 768 },
 };
 function buildWorkflow(modelFile, family, loras, sizeMult, stepsMult, prompt, negative) {
@@ -314,7 +314,16 @@ async function runJob(job) {
     try {
         const st = ST;
         if (!st.enabled) throw new Error('文生图已关闭');
-        const family = st.auto_model ? (st.family || detectFamily(st.auto_model)) : 'anima';
+        // 确定模型：面板选了就用它；没选 → 自动挑一个（优先 sdxl 稳定模型）
+        let model_file = (st.auto_model || '').trim();
+        if (!model_file) {
+            const am = await autoModels(false);
+            const pick = am.find(m => m.family === 'sdxl') || am[0];
+            model_file = pick ? pick.file : '';
+            if (model_file) { st.auto_model = model_file; st.family = detectFamily(model_file); saveState(); }
+        }
+        if (!model_file) throw new Error('未选择模型（请在面板④ 模型选择 里选一个）');
+        const family = st.family || detectFamily(model_file);
         broadcast({ type: 'stage', stage: 'engineer', msg: '🤖 提示词生成中…' });
         const pr = await engineer(job.text, family);
         const negative = 'bad quality, worst quality, lowres, blurry, extra limbs, deformed hands, text, watermark'
@@ -329,7 +338,7 @@ async function runJob(job) {
             log('[gen] 使用自定义工作流', Object.keys(wf).length, '节点');
         } else {
             const lorasList = (st.loras || []).map(f => [f, 0.8, 0.8]);
-            wf = buildWorkflow(st.auto_model || st.key, family, lorasList, st.size_mult, st.steps_mult, pr.positive, negative);
+            wf = buildWorkflow(model_file, family, lorasList, st.size_mult, st.steps_mult, pr.positive, negative);
         }
         const clientId = crypto.randomUUID();
         const resp = await comfyPost('/prompt', { prompt: wf, client_id: clientId }, 60000);

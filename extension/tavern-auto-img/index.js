@@ -1,7 +1,8 @@
 // Tavern Auto Image — 酒馆自动文生图显示扩展 v2.0
 // ① SSE 订阅 8645：收到"图好了"事件 → 图片作为消息显示在聊天
 // ② 设置面板：模型下拉 + LoRA 勾选清单 + 速度档位(尺寸/步数倍率) + 总开关 → POST 8645/model 持久化
-import { chat, addOneMessage, saveChatDebounced } from '../../../../script.js';
+import { chat, addOneMessage, saveChatDebounced, getRequestHeaders, appendMediaToMessage } from '../../../../script.js';
+import { saveBase64AsFile } from '../../../utils.js';
 
 const BRIDGE = 'http://127.0.0.1:8645';
 let eventSource = null;
@@ -9,19 +10,335 @@ let connected = false;
 // 设置控件引用（buildSettingsUI 里赋值，供事件触发读取当前设置）
 let modelSel = null, loraBox = null, sizeSel = null, stepsSel = null, autoModelSel = null;
 
+// ── 无桥模式本地配置（统一 key 'taImgLocalCfg'）──────────────────
+function taGetLocalCfg() {
+    try { return JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}') || {}; } catch (e) { return {}; }
+}
+function taSetLocalCfg(patch) {
+    const next = Object.assign({}, taGetLocalCfg(), patch);
+    try { localStorage.setItem('taImgLocalCfg', JSON.stringify(next)); } catch (e) { /* 存储被禁时忽略 */ }
+    return next;
+}
+// 面板通道状态切换（buildPanelUI 内部赋真实现；默认空实现）
+let applyChannelUI = () => {};
+// 面板状态整体刷新（通道变化时调用；buildPanelUI 内部赋真实现）
+let panelRefreshStatus = () => {};
+// 图片附加目标：本次触发的角色消息对象（图挂到它下方，不新增系统消息）；null 时用兜底查找
+let pendingImgTarget = null;
+
+// ═══════════ 无桥模式（ST 原生代理，零桥也能出图）═══════════
+const TA_ENGINEER_SYSTEM = `你是文生图提示词工程师。用户会给你一段酒馆角色的剧情回复文本，你输出可直接用于 ComfyUI 文生图的英文正向提示词。
+规则：
+1. 只依据给出的剧情文本构建，文本没写的一律不加（衣服/发色/场景/情绪按原文）。
+2. 性别按原文判断：男性/少年 → male 相关词；女性/少女 → female/1girl；不明 → female。
+3. 不要输出任何分析、解释、代码块，只输出 JSON。
+输出格式：{"positive":"英文提示词,用逗号分隔","male":true或false}`;
+
+const ST_FAMILY_RULES = [
+    [['anima', 'unholy', 'hassaku', 'nova', 'miaomiao', 'anima29', 'turbo'], 'anima'],
+    [['krea2', 'gonzalomo', 'moody'], 'krea2'],
+    [['flux', 'dev', 'z_image', 'zimage', 'zit'], 'flux'],
+    [['kodoranime'], 'sdxl'],
+];
+const ST_CP_HINTS = ['kodoranime', 'unrealvision', 'sdxl', 'pony', 'illustrious', 'anything'];
+function stDetectFamily(f) {
+    const n = (f || '').toLowerCase();
+    for (const [kws, fam] of ST_FAMILY_RULES) if (kws.some(k => n.includes(k))) return fam;
+    if (ST_CP_HINTS.some(k => n.includes(k))) return 'sdxl';
+    return 'anima';
+}
+const ST_RECIPES = {
+    anima: { clip: ['miaomiaoHarem_anima16_txt.safetensors', 'qwen_image'], vae: 'qwen_image-vae.safetensors', latent: ['EmptySD3LatentImage', 16], sampler: 'euler', scheduler: 'simple', steps: 20, cfg: 4.0, width: 512, height: 768 },
+    krea2: { clip: ['gonzalomoKrea2_v40_txt.safetensors', 'krea2'], vae: 'qwen_image-vae.safetensors', latent: ['EmptySD3LatentImage', 16], sampler: 'er_sde', scheduler: 'simple', steps: 8, cfg: 1.0, width: 832, height: 1216 },
+    flux: { clip: ['t5xxl_fp8_e4m3fn.safetensors', 'flux'], vae: 'flux-vae-bf16.safetensors', latent: ['EmptySD3LatentImage', 16], sampler: 'euler', scheduler: 'simple', steps: 20, cfg: 1.0, width: 832, height: 1216, dual: true, clip2: 'clip_l.safetensors' },
+    sdxl: { checkpoint: true, latent: ['EmptyLatentImage', 4], sampler: 'euler', scheduler: 'normal', steps: 20, cfg: 7.0, width: 512, height: 768 },
+};
+function stBuildWorkflow(modelFile, family, loras, sizeMult, stepsMult, positive, negative) {
+    const rec = ST_RECIPES[family] || ST_RECIPES['anima'];
+    let nid = 0;
+    const wf = {};
+    const nxt = () => String(++nid);
+    const clipText = (n, clipRef, text) => { wf[n] = { class_type: 'CLIPTextEncode', inputs: { clip: clipRef, text } }; };
+    let modelRef, clipRef, vaeRef;
+    if (rec.checkpoint) {
+        const n = nxt();
+        wf[n] = { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: modelFile } };
+        modelRef = [n, 0]; clipRef = [n, 1]; vaeRef = [n, 2];
+    } else {
+        const mn = nxt();
+        wf[mn] = { class_type: 'UNETLoader', inputs: { unet_name: modelFile, weight_dtype: 'default' } };
+        modelRef = [mn, 0];
+        const cn = nxt();
+        if (rec.dual) {
+            wf[cn] = { class_type: 'DualCLIPLoader', inputs: { clip_name1: rec.clip2, clip_name2: rec.clip[0], type: 'flux' } };
+        } else {
+            wf[cn] = { class_type: 'CLIPLoader', inputs: { clip_name: rec.clip[0], type: rec.clip[1] || 'flux' } };
+        }
+        clipRef = [cn, 0];
+        const vn = nxt();
+        wf[vn] = { class_type: 'VAELoader', inputs: { vae_name: rec.vae } };
+        vaeRef = [vn, 0];
+    }
+    const w = Math.round(rec.width * sizeMult / 8) * 8;
+    const h = Math.round(rec.height * sizeMult / 8) * 8;
+    const steps = Math.max(1, Math.round(rec.steps * stepsMult));
+    const ln = nxt();
+    wf[ln] = { class_type: rec.latent[0], inputs: rec.latent[0] === 'EmptySD3LatentImage' ? { width: w, height: h, batch_size: 1, channels: rec.latent[1] } : { width: w, height: h, batch_size: 1 } };
+    const pn = nxt(); clipText(pn, clipRef, positive);
+    const nn = nxt(); clipText(nn, clipRef, negative);
+    const sn = nxt();
+    wf[sn] = { class_type: 'KSampler', inputs: { model: modelRef, seed: Math.floor(Math.random() * 2 ** 31), steps, cfg: rec.cfg, sampler_name: rec.sampler, scheduler: rec.scheduler, denoise: 1.0, negative: [nn, 0], positive: [pn, 0], latent_image: [ln, 0] } };
+    const dn = nxt();
+    wf[dn] = { class_type: 'VAEDecode', inputs: { samples: [sn, 0], vae: vaeRef } };
+    const fnn = nxt();
+    wf[fnn] = { class_type: 'SaveImage', inputs: { images: [dn, 0], filename_prefix: 'tavern_auto' } };
+    if (loras && loras.length) {
+        let cm = modelRef, cc = clipRef;
+        for (const [lf, sm, sc] of loras) {
+            const ln2 = nxt();
+            wf[ln2] = { class_type: 'LoraLoader', inputs: { lora_name: lf, strength_model: sm, strength_clip: sc, model: cm, clip: cc } };
+            cm = [ln2, 0]; cc = [ln2, 1];
+        }
+        wf[sn].inputs.model = cm;
+    }
+    return wf;
+}
+
+let stAbort = null;  // 无桥模式中断信号
+
+/** 无桥模式：提示词工程器（走酒馆主 API 代理，同源无密钥） */
+async function stEngineer(text, family) {
+    const llmCfg = taGetLocalCfg().llm || {};
+    const llmEndpoint = (document.getElementById('tavern-img-llm-endpoint')?.value || '').trim() || llmCfg.endpoint || 'http://127.0.0.1:18789/v1';
+    const llmModel = (document.getElementById('tavern-img-llm-model')?.value || '').trim() || llmCfg.model || 'openclaw/tavern';
+    // 提示词规则：无桥本地 prompt_edit 非空时覆盖默认工程器模板（{family} 占位符保留）
+    let stSys = TA_ENGINEER_SYSTEM;
+    try { const pe = (taGetLocalCfg().prompt_edit || '').trim(); if (pe) stSys = pe; } catch (e) { /* 忽略 */ }
+    const body = {
+        messages: [
+            { role: 'system', content: stSys.replace('{family}', family) },
+            { role: 'user', content: `模型族：${family}\n剧情回复文本：\n${(text || '').slice(0, 6000)}` },
+        ],
+        chat_completion_source: 'custom',
+        custom_url: llmEndpoint,
+        model: llmModel,
+        max_tokens: 1200,
+        temperature: 0.8,
+        stream: false,
+    };
+    const r = await fetch('/api/backends/chat-completions/generate', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify(body),
+        signal: stAbort ? stAbort.signal : undefined,
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(String(j?.error?.message || 'LLM 调用失败 ' + r.status));
+    const content = j?.choices?.[0]?.message?.content || '';
+    try {
+        const m = content.match(/\{[\s\S]*\}/);
+        const p = JSON.parse(m ? m[0] : content);
+        return { positive: String(p.positive || p.prompt || '').trim(), male: !!p.male };
+    } catch (e) {
+        return { positive: content.trim().replace(/^["'`]+|["'`]+$/g, ''), male: false };
+    }
+}
+
+/** 无桥模式：自定义工作流占位符替换（遍历节点，把 {prompt}/{negative} 换成本次提示词） */
+function applyWfCustom(wf, positive, negative) {
+    const deep = (v) => {
+        if (typeof v === 'string') return v.replace(/\{prompt\}/g, () => positive).replace(/\{negative\}/g, () => negative);
+        if (Array.isArray(v)) return v.map(deep);
+        if (v && typeof v === 'object') {
+            const o = {};
+            for (const k of Object.keys(v)) o[k] = deep(v[k]);
+            return o;
+        }
+        return v;
+    };
+    return deep(wf);
+}
+
+/** 无桥前置体检：节点齐不齐 + 家族依赖的 CLIP/VAE 在不在（直连 object_info，CORS 已开） */
+async function stPreflight(family, comfyUrl) {
+    const need = new Set(['CheckpointLoaderSimple', 'UNETLoader', 'CLIPLoader', 'DualCLIPLoader', 'CLIPTextEncode', 'KSampler', 'VAEDecode', 'SaveImage', 'EmptyLatentImage', 'EmptySD3LatentImage', 'VAELoader', 'LoraLoader']);
+    const rec = ST_RECIPES[family] || ST_RECIPES['anima'];
+    const r = await fetch(`${comfyUrl}/object_info`);
+    if (!r.ok) throw new Error('无法读取 ComfyUI 节点信息（' + r.status + '）');
+    const oi = await r.json();
+    const missing = [...need].filter(n => !oi[n]);
+    if (missing.length) throw new Error(`ComfyUI 缺少节点：${missing.join('、')}（请安装对应节点包）`);
+    const needClip = rec.checkpoint ? [] : (rec.dual ? [rec.clip2, rec.clip[0]] : [rec.clip[0]]);
+    const clips = (oi['CLIPLoader']?.input?.required?.clip_name?.[0] || oi['CLIPLoader']?.input?.required?.clip_name?.[1]?.options || []);
+    const vaes = (oi['VAELoader']?.input?.required?.vae_name?.[0] || oi['VAELoader']?.input?.required?.vae_name?.[1]?.options || []);
+    const missFiles = [...needClip.filter(c => !clips.includes(c)), ...((!rec.checkpoint && !vaes.includes(rec.vae)) ? [rec.vae] : [])];
+    if (missFiles.length) throw new Error(`模型族「${family}」缺依赖文件：${missFiles.join('、')}（放入 ComfyUI models/text_encoders 或 models/vae）`);
+}
+
+/** 无桥模式：全链出图（工程器 → 工作流 → ST 代理 → 存文件 → 嵌入聊天） */
+async function generateViaST(text, name) {
+    console.log('[ta-img][st] ① 进入无桥出图', { textLen: (text || '').length, name });
+    const localCfg = taGetLocalCfg();
+    let modelFile = (autoModelSel?.val() || '').trim() || (modelSel?.val() || '').trim();
+    if (!modelFile) modelFile = (localCfg.auto_model || '').trim();   // 面板未加载时从本地兜底
+    const family = modelFile ? stDetectFamily(modelFile) : 'anima';
+    // LoRA：面板勾选优先；无勾选时用无桥手动清单（localStorage）
+    let loras = loraBox ? Array.from(loraBox.find('input[type=checkbox]:checked')).map(c => c.getAttribute('data-file') || '') : [];
+    if (!loras.length && Array.isArray(localCfg.loras)) loras = localCfg.loras;
+    const fNum = (s, d) => { const n = parseFloat(s); return isFinite(n) ? n : d; };
+    const sizeMult = fNum(sizeSel?.val(), fNum(String(localCfg.size_mult ?? ''), 1));
+    const stepsMult = fNum(stepsSel?.val(), fNum(String(localCfg.steps_mult ?? ''), 1));
+    let comfyUrl = (document.getElementById('tavern-img-comfy')?.value || '').trim() || (localCfg.comfy_url || '').trim() || 'http://127.0.0.1:8188';
+    comfyUrl = comfyUrl.replace(/\/+$/, '');
+
+    toastr.info('🤖 提示词生成中…（无桥模式·走酒馆主 API）', '自动文生图');
+    const pr = await stEngineer(text, family).catch(e => { throw new Error('提示词生成失败:' + e.message); });
+    const negative = 'bad quality, worst quality, lowres, blurry, extra limbs, deformed hands, text, watermark'
+        + (pr.male ? ', female, woman, girl, big breasts, cleavage, westerner, caucasian' : '');
+    toastr.info('✅ 提示词完成，开始生图…', '自动文生图');
+
+    // 自定义工作流优先：已启用且粘贴了 API JSON → 替换占位符后直接用（模型/参数由 JSON 决定）
+    const wfCfg = localCfg.wf || {};
+    const useCustomWf = !!(wfCfg.enabled && wfCfg.wf && typeof wfCfg.wf === 'object' && !Array.isArray(wfCfg.wf) && Object.keys(wfCfg.wf).length);
+    if (!useCustomWf && !modelFile) throw new Error('未选择模型（在控制台④ 模型选择里挑一个）');
+    if (!useCustomWf) await stPreflight(family, comfyUrl);   // 自适应模式：节点+CLIP/VAE 前置体检
+    const lorasArr = loras.map(f => [f, 0.8, 0.8]);
+    const wf = useCustomWf
+        ? applyWfCustom(wfCfg.wf, pr.positive, negative)
+        : stBuildWorkflow(modelFile, family, lorasArr, sizeMult, stepsMult, pr.positive, negative);
+
+    stAbort = new AbortController();
+    const r = await fetch('/api/sd/comfy/generate', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ url: comfyUrl, prompt: '{ "prompt": ' + JSON.stringify(wf) + ' }' }),
+        signal: stAbort.signal,
+    });
+    console.log('[ta-img][st] ⑤ 代理返回', r.status);
+    if (!r.ok) {
+        const t = await r.text().catch(() => '');
+        throw new Error('ComfyUI(代理) 失败: ' + t.slice(0, 200));
+    }
+    const result = await r.json();
+    if (!result.data) throw new Error('ComfyUI 未返回图片数据');
+    console.log('[ta-img][st] ⑥ 拿到 base64，上传中…', result.format);
+    const fmt = (result.format || 'png').toLowerCase();
+    const fname = 'tavern_auto_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    const url = await saveBase64AsFile(result.data, (name || '生图').replace(/[\\/]/g, '_'), fname, fmt);
+    console.log('[ta-img][st] ⑦ 上传成功，url =', url);
+    showImage({ url: url, name: name, model: modelFile });
+    console.log('[ta-img][st] ⑧ showImage 调用完成');
+    return url;
+}
+
+/** 通道探测：桥活着？返回 'bridge'；ST 代理可用？返回 'st'；全无 → 'none' */
+async function detectChannel() {
+    if (connected) return 'bridge';
+    try {
+        const ctl = new AbortController();
+        setTimeout(() => ctl.abort(), 2000);
+        const r = await fetch('/api/sd/comfy/ping', {
+            method: 'POST', headers: getRequestHeaders(),
+            body: JSON.stringify({ url: (document.getElementById('tavern-img-comfy')?.value || 'http://127.0.0.1:8188').trim() }),
+            signal: ctl.signal,
+        });
+        if (r.ok) return 'st';
+    } catch (e) { /* 忽略 */ }
+    return 'none';
+}
+
+// ── 出图占位符：触发即显示“加载中”，图完成替换成图片 ──
+let taSpinInjected = false;
+function injectTaSpinKeyframes() {
+    if (taSpinInjected) return;
+    taSpinInjected = true;
+    $('head').append('<style>@keyframes taSpin{to{transform:rotate(360deg)}}.ta-img-ph{display:flex;align-items:center;gap:12px;width:fit-content;min-width:260px;max-width:480px;margin:6px 0 10px;padding:12px 16px;border-radius:12px;background:rgba(255,255,255,.04);border:1px dashed rgba(255,255,255,.3);color:#aeb4c6;font-size:15px}.ta-img-spin{width:20px;height:20px;border:3px solid rgba(255,255,255,.18);border-top-color:#818cf8;border-radius:50%;animation:taSpin 1s linear infinite;flex-shrink:0}.ta-img-done{margin:6px 0 10px;border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,.12);display:inline-block;max-width:480px;background:rgba(255,255,255,.03)}.ta-img-done img{display:block;max-width:480px;width:100%;height:auto;border-radius:12px;}</style>');
+}
+function addImgPlaceholder(msgId) {
+    let $el = msgId ? $('.mes[mesid="' + msgId + '"]') : $();
+    if (!$el.length) $el = $('.mes').last();          // 消息无 id/未渲染：兜底挂最后一条消息下
+    if (!$el.length) return;                          // 聊天区无消息：跳过（不阻断出图）
+    if ($el.find('.ta-img-ph').length) return;        // 已有占位不重复
+    injectTaSpinKeyframes();
+    // 插到消息内容（mes_text）后面，保持"回复下方"的位置；flex 布局下不能 append 到 .mes 根（会跑右边）
+    const $txt = $el.find('.mes_text').last();
+    if ($txt.length) {
+        $txt.after('<div class="ta-img-ph"><span class="ta-img-spin"></span><span>自动文生图：正在生成图…（完成后自动显示）</span></div>');
+    } else {
+        $el.append('<div class="ta-img-ph"><span class="ta-img-spin"></span><span>自动文生图：正在生成图…（完成后自动显示）</span></div>');
+    }
+}
+function replaceImgPlaceholder(url) {
+    const $p = $('.ta-img-ph').first();
+    if (!$p.length) return false;
+    injectTaSpinKeyframes();
+    $p.replaceWith('<div class="ta-img-done"><img src="' + url + '" alt="生成图" onerror="this.parentElement.remove();"></div>');
+    return true;
+}
+function removeImgPlaceholder() {
+    $('.ta-img-ph').remove();
+}
+
 // 已显示过的图片 url（防重复投递/重复连接导致重复消息）
 const shownImages = new Set();
 
 function showImage(data) {
     try {
         const url = data.url || data.image;
+        console.log('[ta-img][st] ⑨ showImage 进入, url=', url);
         if (!url) return;
         // 三重防重：同 url 已显示 → 跳过（不管谁重复投递）
         if (shownImages.has(url)) return;
         shownImages.add(url);
+        // 有占位符 → 先即时替换成图（视觉；数据层下面继续挂）
+        const replaced = replaceImgPlaceholder(url);
         // 兜底：chat 里已存在同 url 消息 → 跳过
         const ctx = getCtx();
-        if (ctx && ctx.chat && ctx.chat.some(m => m.extra && m.extra.media && m.extra.media.some(x => x.url === url))) return;
+        if (ctx && ctx.chat && ctx.chat.some(m => m.extra && m.extra.media && m.extra.media.some(x => x.url === url))) { if (replaced) toastr.success('✨ 已生成图片', '自动文生图'); return; }
+        // ── 附加到目标角色消息（不新增消息）────────────────────
+        // 目标 = 本次触发者 pendingImgTarget（仍在 chat 中）；否则取最近一条
+        // 非用户、非系统、且名称不含「生图/文生图」的消息
+        let target = null;
+        if (ctx && ctx.chat) {
+            if (pendingImgTarget && ctx.chat.some(m => m && m.id === pendingImgTarget.id)) target = pendingImgTarget;
+            if (!target) {
+                for (let i = ctx.chat.length - 1; i >= 0; i--) {
+                    const m = ctx.chat[i];
+                    if (!m) continue;
+                    const nm = String(m.name || '').toLowerCase();
+                    if (!m.is_user && !m.is_system && !nm.includes('生图') && !nm.includes('文生图')) { target = m; break; }
+                }
+            }
+        }
+        if (target) {
+            target.extra = target.extra || {};
+            target.extra.media = target.extra.media || [];
+            if (!target.extra.media.some(x => x.url === url)) {
+                target.extra.media.push({ url: url, type: 'image', title: data.model || '' });
+                let $el = $('.mes[mesid="' + target.id + '"]');
+                if (!$el.length) $el = $('.mes').last();   // 无 id/未渲染：挂最后一条回复下
+                if ($el.length && !replaced) {
+                    try { appendMediaToMessage(target, $el, 'keep'); } catch (e2) { console.warn('[tavern-auto-img] 追加媒体渲染失败:', e2); }
+                } else if ($el.length && replaced) {
+                    // 已用 DOM 大图替换占位：数据保留（刷新/滚动后仍显示），不重复渲染列表
+                } else {
+                    // 虚拟滚动：目标消息不在渲染池 → 滚到底触发渲染后重试一次
+                    console.info('[tavern-auto-img] 目标消息未渲染，滚动重试…', target.id);
+                    const $chat = $('#chat');
+                    if ($chat.length) {
+                        $chat.scrollTop($chat[0].scrollHeight);
+                        setTimeout(() => {
+                            const $el2 = $('.mes[mesid="' + target.id + '"]');
+                            if ($el2.length) { try { appendMediaToMessage(target, $el2, 'keep'); } catch (e3) { /* 忽略 */ } }
+                        }, 600);
+                    }
+                }
+            }
+            saveChatDebounced();
+            toastr.success('✨ 已生成图片（已附加到角色回复下方）', '自动文生图');
+            return;
+        }
+        // ── 兜底：找不到目标消息 → 原有推送新消息逻辑 ──
         const mes = {
             name: data.name || '生图',
             is_user: false,
@@ -37,7 +354,7 @@ function showImage(data) {
         chat.push(mes);
         addOneMessage(mes);
         saveChatDebounced();
-        toastr.success('✨ 已生成图片', '自动文生图');  // 右上角轻提示（不是聊天框）
+        toastr.success('✨ 已生成图片', '自动文生图');
     } catch (err) {
         console.error('[tavern-auto-img] 显示失败:', err);
     }
@@ -47,6 +364,7 @@ function showImage(data) {
 function showError(data) {
     const msg = (data && (data.message || data.error)) || '出图失败，请查看桥日志';
     try {
+        removeImgPlaceholder();   // 失败时清掉占位符
         toastr.error('🛑 ' + msg, '自动文生图');
         const mes = {
             name: '文生图',
@@ -205,6 +523,12 @@ function buildPanelUI($host) {
         .append('<button id="tavern-img-stop" class="menu_button" title="立即中断正在出图的任务" style="background:#7a1f1f;color:#fff;font-size:15px;padding:4px 12px;white-space:nowrap;min-width:96px;"><span class="fa-solid fa-stop" style="margin-right:5px;"></span>停止任务</button>');
     $panel.append($stopRow);
     $stopRow.find('button').on('click', async function () {
+        // 无桥模式：直接中断前端请求（socket 断开 → ST 代理会给 ComfyUI 发 /interrupt）
+        if (stAbort && !stAbort.signal.aborted) {
+            try { stAbort.abort(); toastr.success('已发送急停（无桥模式）', '自动文生图'); }
+            catch (e) { toastr.error('急停失败', '自动文生图'); }
+            return;
+        }
         try {
             const resp = await fetch(BRIDGE + '/cancel', { method: 'POST' });
             const data = await resp.json();
@@ -241,6 +565,37 @@ function buildPanelUI($host) {
     $loraPop.append($loraBox);
     const $loraChips = $('<div id="tavern-img-lora-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;width:100%;"></div>');
     $rowLora.append($loraToggle, $btnLoraRefresh, $loraPop, $loraChips);
+    // 无桥模式 LoRA 手动输入（ST 代理没有枚举端点；装桥后自动枚举勾选）
+    const $stLoraWrap = $('<div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;width:100%;margin-top:4px;"></div>');
+    const $stLoraIn = $('<input id="tavern-img-loras-manual" class="text_pole" style="flex:2;min-width:220px;font-size:15px;" placeholder="逗号分隔 LoRA 文件名，如 femboysXL.safetensors, japanese_girl_v1.1.safetensors">');
+    const $stLoraBtn = $('<button id="tavern-img-loras-manual-save" class="menu_button" style="min-width:70px;font-size:15px;white-space:nowrap;">💾 保存</button>');
+    const $loraManualHint = $('<span class="muted" style="font-size:14px;width:100%;margin-top:2px;">（无桥模式：LoRA 需手动输入，文件放在 ComfyUI 的 models/loras 目录；装桥后可自动枚举）</span>');
+    $stLoraWrap.append($stLoraIn, $stLoraBtn, $loraManualHint);
+    $rowLora.append($stLoraWrap);
+    $stLoraWrap.hide();
+    function updateManualLoraChips() {
+        const arr = taGetLocalCfg().loras || [];
+        $loraChips.empty();
+        arr.forEach(f => {
+            const short = String(f).replace(/\.safetensors$/i, '').slice(0, 22);
+            $loraChips.append(`<span style="background:#232543;border:1px solid rgba(129,140,248,.45);color:#a5b4fc;border-radius:8px;padding:3px 10px;font-size:13px;">${short}</span>`);
+        });
+        if (arr.length) $loraChips.prepend(`<span style="font-size:13px;color:rgba(230,230,242,.6);align-self:center;">已选（手动）：</span>`);
+        $loraToggle.text(arr.length ? `LoRA：手动 ${arr.length}` : 'LoRA：手动 0');
+    }
+    $stLoraBtn.on('click', function () {
+        const arr = ($stLoraIn.val() || '').split(/[,，]+/).map(s => s.trim()).filter(Boolean);
+        taSetLocalCfg({ loras: arr });
+        updateManualLoraChips();
+        toastr.success(arr.length ? `已保存 ${arr.length} 个 LoRA（无桥·本地）` : '已清空 LoRA（无桥·本地）', '自动文生图');
+    });
+    (function initManualLora() {
+        try {
+            const arr = taGetLocalCfg().loras || [];
+            if (Array.isArray(arr) && arr.length) $stLoraIn.val(arr.join(', '));
+            updateManualLoraChips();
+        } catch (e) { /* 忽略 */ }
+    })();
     $panel.append($rowLora);
 
     function updateLoraBadge() {
@@ -425,6 +780,15 @@ function buildPanelUI($host) {
     $(document).on('keydown.tapm', function (e) { if (e.key === 'Escape') closePromptModal(); });
 
     function loadPrompt() {
+        if (!connected) {
+            // 无桥模式：本地 prompt_edit
+            const pe = (taGetLocalCfg().prompt_edit || '');
+            if (pe) $taPrompt.val(pe);
+            const act = !!pe.trim();
+            $promptStatus.text(act ? '（自定义已生效）' : '（默认模板）').css('color', act ? '#8bc34a' : '');
+            $pmStatus.text(act ? '（自定义已生效）' : '（默认模板）').css('color', act ? '#8bc34a' : '');
+            return;
+        }
         fetch(BRIDGE + '/prompt').then(r => r.json()).then(d => {
             if (!d) return;
             $taPrompt.val(d.override || d.system || '');
@@ -434,6 +798,15 @@ function buildPanelUI($host) {
     }
     $btnPromptToggle.on('click', openPromptModal);
     $btnPromptSave.on('click', async function () {
+        if (!connected) {
+            // 无桥模式：规则文本存本地，stEngineer 出图时覆盖默认模板
+            taSetLocalCfg({ prompt_edit: $taPrompt.val() });
+            const act = !!($taPrompt.val() || '').trim();
+            $promptStatus.text(act ? '（自定义已生效）' : '（默认模板）').css('color', act ? '#8bc34a' : '');
+            $pmStatus.text(act ? '（自定义已生效）' : '（默认模板）').css('color', act ? '#8bc34a' : '');
+            toastr.success(act ? '提示词规则已保存并生效（无桥·本地）' : '已恢复默认模板（无桥·本地）', '自动文生图');
+            return;
+        }
         try {
             const resp = await fetch(BRIDGE + '/prompt', {
                 method: 'POST',
@@ -449,6 +822,15 @@ function buildPanelUI($host) {
         } catch (e) { toastr.error('保存失败：' + (e?.message || e), '自动文生图'); }
     });
     $btnPromptReset.on('click', async function () {
+        if (!connected) {
+            // 无桥模式：清空本地规则文本
+            taSetLocalCfg({ prompt_edit: '' });
+            $taPrompt.val('');
+            $promptStatus.text('（默认模板）').css('color', '');
+            $pmStatus.text('（默认模板）').css('color', '');
+            toastr.success('已恢复默认模板（无桥·本地）', '自动文生图');
+            return;
+        }
         try {
             const resp = await fetch(BRIDGE + '/prompt', {
                 method: 'POST',
@@ -467,12 +849,39 @@ function buildPanelUI($host) {
     }); 
     loadPrompt();
 
-    // ⑧ 自定义工作流（可选）：粘贴自己 JSON，启用后自动构建器让位
-    const $rowWf = mkRow('fa-diagram-project', '⑧ 工作流（可选·自定义）：');
-    const $btnWfToggle = $('<button id="tavern-img-wf-toggle" class="menu_button" style="min-width:150px;font-size:16px;white-space:nowrap;">🧩 自定义工作流</button>');
+    // ⑧ 工作流模式：🤖 自适应（傻瓜式·推荐） / 🧩 自定义工作流（粘贴JSON，高级）
+    const $rowWf = mkRow('fa-diagram-project', '⑧ 工作流模式：');
+    const $btnWfAuto = $('<button id="tavern-img-wf-auto" class="menu_button" style="min-width:118px;font-size:15px;white-space:nowrap;padding:6px 10px;">🤖 自适应（推荐）</button>');
+    const $btnWfToggle = $('<button id="tavern-img-wf-toggle" class="menu_button" title="粘贴你自己的 API 格式工作流 JSON，启用后自动构建让位" style="min-width:132px;font-size:15px;white-space:nowrap;padding:6px 10px;">🧩 自定义工作流</button>');
     const $wfStatus = $('<span class="muted" style="margin-left:8px;font-size:15px;"></span>');
-    $rowWf.append($btnWfToggle, $wfStatus);
+    $rowWf.append($btnWfAuto, $btnWfToggle, $wfStatus);
     $panel.append($rowWf);
+    function setWfMode(mode) {
+        const on = 'border:2px solid rgba(139,195,74,.65)!important;color:#c6e8c6!important;background:rgba(139,195,74,.10)!important;';
+        const off = 'border:1px solid rgba(255,255,255,.12);color:#e8e8f2;';
+        $btnWfAuto.attr('style', $btnWfAuto.attr('style').replace(/border[^;]*;/g, '').replace(/color:[^;]*;/g, '').replace(/background:[^;]*;/g, '') + ';' + (mode === 'auto' ? on : off));
+        $btnWfToggle.attr('style', $btnWfToggle.attr('style').replace(/border[^;]*;/g, '').replace(/color:[^;]*;/g, '').replace(/background:[^;]*;/g, '') + ';' + (mode === 'custom' ? on : off));
+    }
+    function wfHasContent(w) { return !!(w && typeof w === 'object' && !Array.isArray(w) && Object.keys(w).length); }
+    $btnWfAuto.on('click', async function () {
+        // 切回自适应模式（自动构建）：置 enabled=false
+        if (!connected) { taSetLocalCfg({ wf: { enabled: false, wf: (taGetLocalCfg().wf || {}).wf || {} } }); }
+        else { try { await fetch(BRIDGE + '/workflow', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false, wf: {} }) }); } catch (e) { /* 忽略 */ } }
+        setWfMode('auto');
+        $wfStatus.text('（自适应·自动构建）').css('color', '');
+        toastr.info('已切换到自适应模式：自动选择模型/LoRA 构建工作流', '自动文生图');
+    });
+    $btnWfToggle.on('click', async function () {
+        openWfModal();
+        // 若已有自定义 JSON → 直接进出自定义模式；没有 → 打开弹窗让用户粘贴
+        const cur = !connected ? (taGetLocalCfg().wf || {}) : null;
+        const hasWf = !connected ? wfHasContent(cur.wf) : null;
+        if (!connected && hasWf) {
+            taSetLocalCfg({ wf: { enabled: true, wf: cur.wf } });
+            setWfMode('custom');
+            $wfStatus.text('（自定义已启用）').css('color', '#8bc34a');
+        }
+    });
     const $wfOv = $('<div id="ta-img-wf-ov" style="position:fixed;inset:0;z-index:10060;display:none;background:rgba(0,0,0,.6);align-items:center;justify-content:center;"></div>')
         .on('click', function (e) { if (e.target === this) closeWfModal(); });
     const $wfCard = $('<div style="width:min(820px,94vw);max-height:90vh;overflow-y:auto;background:#161724;border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:16px 18px;box-shadow:0 30px 90px rgba(0,0,0,.75);"></div>')
@@ -493,11 +902,22 @@ function buildPanelUI($host) {
     $(document).on('keydown.tawf', function (e) { if (e.key === 'Escape') closeWfModal(); });
 
     function loadWf() {
+        if (!connected) {
+            // 无桥模式：本地 wf={enabled,wf}
+            const lw = taGetLocalCfg().wf || {};
+            const hasWf = !!(lw.wf && typeof lw.wf === 'object' && !Array.isArray(lw.wf) && Object.keys(lw.wf).length);
+            $taWf.val(lw.wf ? JSON.stringify(lw.wf, null, 2) : '');
+            $wfEn.prop('checked', !!lw.enabled);
+            $wfStatus.text(lw.enabled && hasWf ? '（自定义已启用）' : '（自适应·自动构建）').css('color', lw.enabled && hasWf ? '#8bc34a' : '');
+            setWfMode(lw.enabled && hasWf ? 'custom' : 'auto');
+            return;
+        }
         fetch(BRIDGE + '/workflow').then(r => r.json()).then(d => {
             if (!d) return;
             $taWf.val(d.wf ? JSON.stringify(d.wf, null, 2) : '');
             $wfEn.prop('checked', !!d.enabled);
-            $wfStatus.text(d.enabled && d.wf ? '（自定义已启用）' : '（自动构建）').css('color', d.enabled && d.wf ? '#8bc34a' : '');
+            $wfStatus.text(d.enabled && d.wf ? '（自定义已启用）' : '（自适应·自动构建）').css('color', d.enabled && d.wf ? '#8bc34a' : '');
+            setWfMode(d.enabled && d.wf ? 'custom' : 'auto');
         }).catch(() => {});
     }
     $btnWfToggle.on('click', openWfModal);
@@ -508,6 +928,14 @@ function buildPanelUI($host) {
             try { wf = JSON.parse(txt); }
             catch (e) { toastr.error('JSON 格式错误：' + e.message, '自动文生图'); return; }
             if (typeof wf !== 'object' || Array.isArray(wf)) { toastr.error('工作流必须是节点对象（{…}）', '自动文生图'); return; }
+        }
+        if (!connected) {
+            // 无桥模式：工作流存本地，generateViaST 出图前优先使用
+            taSetLocalCfg({ wf: { enabled: $wfEn.prop('checked'), wf: wf } });
+            const hasWf = !!(wf && typeof wf === 'object' && !Array.isArray(wf) && Object.keys(wf).length);
+            $wfStatus.text($wfEn.prop('checked') && hasWf ? '（自定义已启用）' : '（自动构建）').css('color', $wfEn.prop('checked') && hasWf ? '#8bc34a' : '');
+            toastr.success($wfEn.prop('checked') && hasWf ? `自定义工作流已启用（${Object.keys(wf).length} 节点·无桥本地）` : '已切换为自动构建（无桥本地）', '自动文生图');
+            return;
         }
         try {
             const resp = await fetch(BRIDGE + '/workflow', {
@@ -524,6 +952,12 @@ function buildPanelUI($host) {
     });
     $btnWfClear.on('click', async function () {
         $taWf.val(''); $wfEn.prop('checked', false);
+        if (!connected) {
+            taSetLocalCfg({ wf: { enabled: false, wf: {} } });
+            $wfStatus.text('（自动构建）').css('color', '');
+            toastr.success('已清空自定义工作流（自动构建）', '自动文生图');
+            return;
+        }
         try {
             await fetch(BRIDGE + '/workflow', {
                 method: 'POST',
@@ -571,7 +1005,27 @@ function buildPanelUI($host) {
             }
             return false;
         } catch (e) { /* 防御：桥未实现 /loras 时静默回退 */ }
-        return false;
+        // ── 无桥模式：浏览器直连 ComfyUI 枚举 LoRA（ComfyUI 已开 --enable-cors-header）──
+        return fetchLorasViaComfy();
+    }
+
+    /** 无桥 LoRA 自动枚举：直连 {comfyUrl}/object_info/LoraLoader（失败回退 false） */
+    async function fetchLorasViaComfy() {
+        try {
+            let comfyUrl = (document.getElementById('tavern-img-comfy')?.value || '').trim() || 'http://127.0.0.1:8188';
+            try { comfyUrl = comfyUrl || (JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}').comfy_url || '').trim() || 'http://127.0.0.1:8188'; } catch (e) { /* 忽略 */ }
+            comfyUrl = comfyUrl.replace(/\/+$/, '');
+            const r = await fetch(`${comfyUrl}/object_info/LoraLoader`);
+            if (!r.ok) return false;
+            const oi = await r.json();
+            const req = oi?.LoraLoader?.input?.required?.lora_name;
+            let list = [];
+            if (Array.isArray(req?.[0])) list = req[0];
+            else if (Array.isArray(req?.[1]?.options)) list = req[1].options;
+            if (!list.length) return false;
+            currentLoras = list.filter(x => typeof x === 'string').map(f => ({ file: f, family: stDetectFamily(f), label: f, meta_err: '' }));
+            return true;
+        } catch (e) { return false; }
     }
 
     // 当前选中模型的家族：动态模型优先（currentAutoModels 里选中文件的 family），
@@ -644,12 +1098,20 @@ function buildPanelUI($host) {
         $loraBox.find('input[type=checkbox]').each(function () {
             if (this.checked) loras.push(this.getAttribute('data-file'));
         });
+        const sizeMultV = parseFloat($sizeSel.val());
+        const stepsMultV = parseFloat($stepsSel.val());
         const body = {
             key: $select.val(),
             loras: loras,
-            size_mult: parseFloat($sizeSel.val()),
-            steps_mult: parseFloat($stepsSel.val()),
+            size_mult: sizeMultV,
+            steps_mult: stepsMultV,
         };
+        if (!connected) {
+            // 无桥模式：速度档位存本地（模型/LoRA 由各自面板项保存）
+            taSetLocalCfg({ size_mult: Number.isFinite(sizeMultV) ? sizeMultV : 1, steps_mult: Number.isFinite(stepsMultV) ? stepsMultV : 1 });
+            toastr.success('速度档位已保存（无桥模式·本地）', '自动文生图');
+            return;
+        }
         try {
             const resp = await fetch(BRIDGE + '/model', {
                 method: 'POST',
@@ -667,7 +1129,7 @@ function buildPanelUI($host) {
     async function loadModelOptions() {
         try {
             const resp = await fetch(BRIDGE + '/model');
-            if (!resp.ok) return;
+            if (!resp.ok) throw new Error('桥不可用');
             const data = await resp.json();
             const optKeys = Object.keys(data.options || {});
             // 静态预设行默认隐藏：日常用动态模型（自动发现）；静态 8 键参数保留在桥侧 presets 文件
@@ -707,9 +1169,51 @@ function buildPanelUI($host) {
             $btn.toggleClass('on', data.enabled !== false);
             $swState.text(data.enabled === false ? '关闭' : '开启').css('color', data.enabled === false ? '#8a8f9e' : '#8bc34a');
         } catch (e) {
-            $select.empty().append('<option value="">桥接服务未连接</option>');
-            $btn.toggleClass('on', false);
-            $swState.text('?').css('color', '#8a8f9e');
+            // ── 桥不可用 → 无桥模式：用 ST 代理拉模型清单（零桥也能选模型）──
+            try {
+                const comfyUrl = (document.getElementById('tavern-img-comfy')?.value || '').trim() || 'http://127.0.0.1:8188';
+                const mr = await fetch('/api/sd/comfy/models', {
+                    method: 'POST', headers: getRequestHeaders(),
+                    body: JSON.stringify({ url: comfyUrl.replace(/\/+$/, '') }),
+                });
+                if (mr.ok) {
+                    const arr = await mr.json();
+                    const recs = (Array.isArray(arr) ? arr : []).map(m => ({ file: m.value, family: stDetectFamily(m.value), label: m.text || m.value }));
+                    currentAutoModels = recs;
+                    $rowAuto.show();
+                    $autoSel.empty().append('<option value="">未选择</option>');
+                    recs.forEach(m => { $autoSel.append(`<option value="${m.file}">${m.label || m.file}</option>`); });
+                    // 没选过 → 默认选第一个（优先轻量 SDXL，出图快）；再挑第一个
+                    const saved = JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}').auto_model || '';
+                    if (saved && recs.some(m => m.file === saved)) $autoSel.val(saved);
+                    else {
+                        const fast = recs.find(m => m.family === 'sdxl') || recs[0];
+                        if (fast) $autoSel.val(fast.file);
+                    }
+                    const cur = $autoSel.val();
+                    if (cur) {
+                        const rec = recs.find(m => m.file === cur);
+                        $autoHint.text(rec ? `家族：${rec.family || '-'}` : '');
+                        localStorage.setItem('taImgLocalCfg', JSON.stringify({ ...(JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}')), auto_model: cur }));
+                    }
+                    // 回填速度档位（无桥·本地保存值，免得每次刷新重选）
+                    try {
+                        const lc = JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}');
+                        if (lc.size_mult != null) $sizeSel.val(String(lc.size_mult));
+                        if (lc.steps_mult != null) $stepsSel.val(String(lc.steps_mult));
+                    } catch (e) { /* 忽略 */ }
+                    $select.empty().append('<option value="">无桥模式（模型在右侧动态列表）</option>');
+                } else {
+                    $select.empty().append('<option value="">桥接服务未连接</option>');
+                }
+            } catch (e2) {
+                $select.empty().append('<option value="">桥接服务未连接</option>');
+            }
+            // 无桥模式：总开关状态读本地；面板按无桥能力灰化
+            const en = (taGetLocalCfg().enabled !== false);
+            $btn.toggleClass('on', en);
+            $swState.text(en ? '开启' : '关闭').css('color', en ? '#8bc34a' : '#8a8f9e');
+            try { applyChannelUI('st'); panelRefreshStatus(); } catch (e) { /* 忽略 */ }
         }
         // 动态 LoRA：若尚未拉取则自动 GET /loras 一次并重渲染（防御：404/异常静默回退静态，不报错）
         if (!currentLoras.length) {
@@ -730,6 +1234,7 @@ function buildPanelUI($host) {
                 $pathsHint.text(rec + (pd.yaml_exists ? '（extra_model_paths 已配置）' : '（尚未配置自选目录）'));
             }
         } catch (e) { /* 忽略目录区 */ }
+        try { refreshModeStats(); } catch (e2) { /* 忽略 */ }
     }
 
     // ── LLM 配置子区：父选项逻辑 ──────────────────────────────
@@ -787,6 +1292,23 @@ function buildPanelUI($host) {
 
     // 服务配置回填（GET /config）：comfy_url 明文回填；llm.mode 决定父选项；custom 只回填 endpoint/model；key 只显示状态图标
     async function checkComfyStatus() {
+        if (!connected) {
+            // 无桥模式：直接探测 ComfyUI（ST 代理 ping 端点，带同级请求头）
+            try {
+                const comfyUrl = ($inComfy.val() || '').trim() || (taGetLocalCfg().comfy_url || '').trim() || 'http://127.0.0.1:8188';
+                const ctl = new AbortController();
+                setTimeout(() => ctl.abort(), 3000);
+                const r = await fetch('/api/sd/comfy/ping', {
+                    method: 'POST', headers: getRequestHeaders(),
+                    body: JSON.stringify({ url: comfyUrl.replace(/\/+$/, '') }),
+                    signal: ctl.signal,
+                });
+                $comfyOk.html(r.ok ? '<span style="color:#8bc34a;">✅ 已连接（无桥·ST 代理探测）</span>' : '<span style="color:#e74c3c;">❌ 未连接</span>');
+            } catch (e) {
+                $comfyOk.html('<span style="color:#e74c3c;">❌ 未连接</span>');
+            }
+            return;
+        }
         try {
             const r = await fetch(BRIDGE + '/comfycheck');
             const d = await r.json();
@@ -833,7 +1355,24 @@ function buildPanelUI($host) {
                     : (data.deepseek_key_set !== undefined ? !!data.deepseek_key_set
                         : !!(data.deepseek_key && String(data.deepseek_key) !== '')));
             $llmHint.text(keySet ? '🔑 已配置' : '🔑 未配置').css('color', keySet ? '#8bc34a' : '');
-        } catch (e) { /* 桥未实现 /config 时忽略 */ }
+        } catch (e) {
+            // 桥不可用 → 无桥模式：从本地恢复 LLM 配置与 ComfyUI 地址
+            try {
+                const lc = taGetLocalCfg();
+                const llm = lc.llm || {};
+                const mode = llm.mode === 'tavern' ? 'tavern' : 'custom';
+                setLlmUI(mode);
+                if (mode === 'tavern') {
+                    $tavernInfo.html(`Endpoint：${llm.endpoint || '-'} · 模型：${llm.model || '-'} · Key：<span style="color:#8bc34a;">✓ 用酒馆 secrets</span>`);
+                } else {
+                    $inLlmEndpoint.val(llm.endpoint || '');
+                    $inLlmModel.val(llm.model || '');
+                }
+                currentLlm = { mode: mode, endpoint: llm.endpoint || '', model: llm.model || '', key_configured: !!llm.key_configured };
+                if (llm.endpoint || llm.model) $llmHint.text('🔑 已就绪（无桥·本地）').css('color', '#8bc34a');
+                if (lc.comfy_url) $inComfy.val(lc.comfy_url);
+            } catch (e2) { /* 忽略 */ }
+        }
     }
 
     $btnPaths.on('click', async function () {
@@ -860,6 +1399,13 @@ function buildPanelUI($host) {
     // 保存 ComfyUI 地址（POST /config {comfy_url}）
     $btnComfy.on('click', async function () {
         const comfy_url = $inComfy.val().trim();
+        if (!connected) {
+            // 无桥模式：地址存本地（无需桥）
+            try { localStorage.setItem('taImgLocalCfg', JSON.stringify({ ...(JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}')), comfy_url })); } catch (e) { /* 忽略 */ }
+            toastr.success('ComfyUI 地址已保存（无桥模式·本地）', '自动文生图');
+            checkComfyStatus();
+            return;
+        }
         try {
             const resp = await fetch(BRIDGE + '/config', {
                 method: 'POST',
@@ -869,6 +1415,7 @@ function buildPanelUI($host) {
             const data = await resp.json();
             if (data.ok) {
                 toastr.success('ComfyUI 地址已保存', '自动文生图');
+                checkComfyStatus();
             } else {
                 toastr.error(data.error || '保存失败', '自动文生图');
             }
@@ -878,8 +1425,28 @@ function buildPanelUI($host) {
     });
 
     // 父选项切换：用酒馆主 API（读取+保存）/ 自定义 API（展开三栏）
-    $llmMode.on('change', function () {
-        if ($(this).val() === 'tavern') { useTavernApi(); }
+    $llmMode.on('change', async function () {
+        if ($(this).val() === 'tavern') {
+            if (!connected) {
+                // 无桥模式：主 API 即 custom 源（key 用酒馆 secrets）→ 读酒馆配置存本地
+                const t = await readTavernApiSettings().catch(() => null);
+                if (t && t.endpoint) {
+                    $inLlmEndpoint.val(t.endpoint);
+                    $inLlmModel.val(t.model || '');
+                    taSetLocalCfg({ llm: { mode: 'tavern', endpoint: t.endpoint, model: t.model || '', key_configured: !!t.key } });
+                    setLlmUI('tavern');
+                    $tavernInfo.html(`Endpoint：${t.endpoint} · 模型：${t.model || '-'} · Key：<span style="color:#8bc34a;">✓ 用酒馆 secrets</span>`);
+                    currentLlm = { mode: 'tavern', endpoint: t.endpoint, model: t.model || '', key_configured: true };
+                    $llmHint.text('🔑 主 API 就绪').css('color', '#8bc34a');
+                    toastr.success('已配置为酒馆主 API（无桥模式·出图时走酒馆代理）', '自动文生图');
+                } else {
+                    toastr.error('无法读取酒馆主 API 配置，请改为自定义 API 并手动填写', '自动文生图');
+                    setLlmUI('custom');
+                }
+                return;
+            }
+            useTavernApi();
+        }
         else { setLlmUI('custom'); }
     });
 
@@ -890,6 +1457,15 @@ function buildPanelUI($host) {
         const model = $inLlmModel.val().trim();
         if (!endpoint || !model) {
             toastr.error('Endpoint 与模型名不能为空', '自动文生图');
+            return;
+        }
+        if (!connected) {
+            // 无桥模式：只存 endpoint/model（key 用酒馆 secrets，不落本地）
+            taSetLocalCfg({ llm: { mode: 'custom', endpoint: endpoint, model: model } });
+            $inLlmKey.val('');
+            $llmHint.text('🔑 已就绪（无桥·本地）').css('color', '#8bc34a');
+            currentLlm = { mode: 'custom', endpoint: endpoint, model: model, key_configured: !!key };
+            toastr.success('✓ 已保存（无桥模式·本地；key 走酒馆 secrets）', '自动文生图');
             return;
         }
         try {
@@ -912,10 +1488,42 @@ function buildPanelUI($host) {
         }
     });
 
-    // 🔌 测试连接（GET /config/test，用桥当前配置；返回 {ok, latency_ms|error}）
+    // 🔌 测试连接（桥模式：GET /config/test；无桥模式：直测酒馆主 API 代理）
     $btnTest.on('click', async function () {
         $btnTest.prop('disabled', true).text('测试中…');
         try {
+            if (!connected) {
+                const t0 = performance.now();
+                let endpoint = $inLlmEndpoint.val().trim() || 'http://127.0.0.1:18789/v1';
+                let model = $inLlmModel.val().trim() || 'openclaw/tavern';
+                if ($llmMode.val() === 'tavern') {
+                    // 无桥·主 API 模式：以酒馆当前主 API 配置为准
+                    const t = await readTavernApiSettings().catch(() => null);
+                    if (t && t.endpoint) { endpoint = t.endpoint; if (t.model) model = t.model; }
+                }
+                const resp = await fetch('/api/backends/chat-completions/generate', {
+                    method: 'POST',
+                    headers: getRequestHeaders(),
+                    body: JSON.stringify({
+                        messages: [{ role: 'user', content: 'ping' }],
+                        chat_completion_source: 'custom',
+                        custom_url: endpoint,
+                        model: model,
+                        max_tokens: 1,
+                        temperature: 0,
+                        stream: false,
+                    }),
+                });
+                const data = await resp.json().catch(() => null);
+                if (resp.ok && data && !data.error) {
+                    const txt = `✓ 主 API 连通 ${Math.round(performance.now() - t0)} ms`;
+                    $llmHint.text(txt).css('color', '#8bc34a');
+                    toastr.success(txt, '自动文生图');
+                } else {
+                    toastr.error(String(data?.error?.message || '连接失败 ' + resp.status), '自动文生图');
+                }
+                return;
+            }
             const resp = await fetch(BRIDGE + '/config/test');
             const data = await resp.json().catch(() => null);
             if (data && data.ok) {
@@ -939,6 +1547,12 @@ function buildPanelUI($host) {
         $autoHint.text(rec ? `家族：${rec.family || '-'} · ${rec.label || rec.file}` : '');
         // 动态模型变更影响 LoRA 家族适配 → 重渲染（保留当前勾选）
         renderLoras(currentOptions, currentKey, readCheckedLoras());
+        // 手动选择也记本地（无桥 generateViaST 兜底；桥模式同存无副作用）
+        taSetLocalCfg({ auto_model: file });
+        if (!connected) {
+            toastr.success(file ? `模型已设为 ${rec?.label || file}（无桥·本地）` : '已清除模型（无桥·本地）', '自动文生图');
+            return;
+        }
         fetch(BRIDGE + '/model', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -968,8 +1582,92 @@ function buildPanelUI($host) {
     // 提升为模块级引用（v3 事件触发用）
     modelSel = $select; loraBox = $loraBox; sizeSel = $sizeSel; stepsSel = $stepsSel; autoModelSel = $autoSel;
 
+    // ── 通道状态切换（无桥模式灰化依赖桥的能力 + 中文说明；桥模式恢复原样）──
+    applyChannelUI = function (ch) {
+        const noBridge = (ch === 'st' || ch === 'none');
+        // ① 模型/LoRA 目录：需要桥写 extra_model_paths；无桥 → 灰化 + 说明
+        $rowPaths.css('opacity', noBridge ? '0.5' : '');
+        $inRoot.prop('disabled', noBridge);
+        $inLora.prop('disabled', noBridge);
+        $btnPaths.prop('disabled', noBridge);
+        $btnRefresh.prop('disabled', noBridge);
+        $rowPaths.find('#tavern-img-browse-model, #tavern-img-browse-lora').prop('disabled', noBridge);
+        $pathsCloudHint.text(noBridge ? '（无桥模式：模型清单由 ComfyUI 自动枚举，目录设置仅桥/本地 ComfyUI 需要）' : '（云部署的 ComfyUI 无需配置目录：模型清单由云端服务器自动提供）');
+        // ③ API Key：无桥用酒馆 secrets 里的自定义 API 密钥，不在本面板填
+        $inLlmKey.prop('disabled', noBridge)
+            .attr('placeholder', noBridge ? '无桥模式：key 用酒馆 secrets（自定义 API 密钥），无需在此填写' : 'API Key（存桥本机，不回显）');
+        // ③ 获取模型列表：需要桥带 key 直连；无桥 → 灰化
+        $btnLlmModels.prop('disabled', noBridge)
+            .attr('title', noBridge ? '无桥模式：请在酒馆主 API 设置里配置模型，此处列表由桥提供' : '从该 API 获取模型列表');
+        // ⑧ 自定义工作流按钮区域不需要灰化（无桥也支持，见本地存储）
+        // ⑤ LoRA：无桥 → 先自动枚举（同桥勾选 UI）；失败才手动输入
+        if (noBridge) {
+            $btnLoraRefresh.prop('disabled', false);
+            $loraToggle.prop('disabled', false);
+            $stLoraWrap.toggle(false);   // 先隐藏手动框，尝试自动
+            fetchLorasViaComfy().then(ok => {
+                if (ok) {
+                    $stLoraWrap.toggle(false);
+                    renderLoras({}, '', readCheckedLoras());
+                    toastr.info('LoRA 已自动枚举（无桥·直连 ComfyUI）', '自动文生图');
+                } else {
+                    $stLoraWrap.toggle(true);        // 直连失败 → 回退手动输入
+                    $loraToggle.prop('disabled', true);
+                }
+            }).catch(() => { $stLoraWrap.toggle(true); $loraToggle.prop('disabled', true); });
+        } else {
+            $loraToggle.prop('disabled', false);
+            $btnLoraRefresh.prop('disabled', false);
+            $stLoraWrap.toggle(false);
+        }
+    };
+
+    // ── 通道感知状态刷新（每次通道变化 bridge/st/none 都调用）──
+    function refreshLlmHint() {
+        if (!connected) {
+            // 无桥：只看 endpoint/模型 是否已填（key 走酒馆 secrets，不显示桥的 key 检测结果）
+            if ($llmMode.val() === 'tavern') {
+                $llmHint.text('🔑 主 API 就绪').css('color', '#8bc34a');
+            } else {
+                const ep = ($inLlmEndpoint.val() || '').trim();
+                const mdl = ($inLlmModel.val() || '').trim();
+                $llmHint.text(ep && mdl ? '🔑 已就绪（无桥·本地）' : '🔑 待填写').css('color', ep && mdl ? '#8bc34a' : '');
+            }
+            return;
+        }
+        // 桥模式：状态由 loadConfig（/config 的 key_configured）负责，这里不动
+    }
+    function refreshWfStatus() {
+        if (!connected) {
+            // 无桥：⑧ 绿勾/状态从本地 wf 配置读
+            const lw = taGetLocalCfg().wf || {};
+            const hasWf = !!(lw.wf && typeof lw.wf === 'object' && !Array.isArray(lw.wf) && Object.keys(lw.wf).length);
+            $wfStatus.text(lw.enabled && hasWf ? '（自定义已启用）' : '（自动构建）').css('color', lw.enabled && hasWf ? '#8bc34a' : '');
+        }
+    }
+    function refreshModeStats() {
+        const n = Array.isArray(currentAutoModels) ? currentAutoModels.length : 0;
+        $modeStats.html(!connected
+            ? ('🟢 无桥模式（ST 代理） · 模型=' + n)
+            : ('🔵 桥接模式 · 模型=' + n));
+    }
+    panelRefreshStatus = function () {
+        checkComfyStatus();     // ② ComfyUI 连接状态（通道感知）
+        refreshLlmHint();       // ③ LLM 状态
+        refreshWfStatus();      // ⑧ 自定义工作流绿勾（无桥读本地）
+        refreshModeStats();     // 底部通道+模型数状态行
+    };
+
     $btn.on('click', async function () {
         const turnOn = !$btn.hasClass('on');   // 按当前视觉状态切换（switch 化后按钮无文本，不能再用 text 判断）
+        if (!connected) {
+            // 无桥模式：开关存本地；triggerOnce 出图前检查
+            $btn.toggleClass('on', turnOn);
+            $swState.text(turnOn ? '开启' : '关闭').css('color', turnOn ? '#8bc34a' : '#8a8f9e');
+            taSetLocalCfg({ enabled: turnOn });
+            toastr.success(turnOn ? '自动文生图已开启（无桥·本地）' : '自动文生图已关闭（酒馆只跑剧情不出图）', '自动文生图');
+            return;
+        }
         try {
             const resp = await fetch(BRIDGE + '/enabled', {
                 method: 'POST',
@@ -989,9 +1687,15 @@ function buildPanelUI($host) {
         }
     });
 
+    // 底部状态行：当前通道 + 已枚举模型数（每次通道变化刷新）
+    const $rowMode = $('<div class="list-group-item flex-container flexGap5" style="align-items:center;flex-wrap:wrap;"></div>');
+    const $modeStats = $('<span class="muted" style="font-size:15px;"></span>');
+    $rowMode.append($modeStats);
+    $panel.append($rowMode);
+
     // 按用户指定顺序重排（DOM 移动，不影响引用）：
     // ①模型/LoRA目录 ②服务配置和API ③模型选择 ④LoRA选择 ⑤速度档位；急停+总开关置顶；提示词规则置底
-    [$stopRow, $rowPaths, $rowCfg, $rowLLM, $rowAuto, $rowLora, $rowSpeed, $rowPrompt, $rowWf, $rowModel]
+    [$stopRow, $rowPaths, $rowCfg, $rowLLM, $rowAuto, $rowLora, $rowSpeed, $rowPrompt, $rowWf, $rowModel, $rowMode]
         .forEach(x => { if (x) $panel.append(x); });
 
     loadModelOptions();
@@ -1009,6 +1713,16 @@ function connect() {
         connected = true;
         console.log('[tavern-auto-img] 已连接桥接服务', BRIDGE + '/events');
         $('#ta-img-bridge-help').remove();   // 桥活了 → 清除安装引导
+        try { applyChannelUI('bridge'); } catch (e) { /* 面板未构建时忽略 */ }
+        try { panelRefreshStatus(); } catch (e) { /* 忽略 */ }
+        // 恢复桥状态胶囊（若之前显示的是无桥样式）
+        try {
+            const $bs0 = $('#ta-img-bind');
+            if ($bs0.length && $bs0.text().includes('无桥')) {
+                $bs0.html('<span style="display:inline-flex;align-items:center;gap:6px;"><span style="width:8px;height:8px;border-radius:50%;background:#8bc34a;box-shadow:0 0 8px #8bc34a;animation:pulse 1.6s infinite;"></span>✅ 已绑定 · 自动出图</span>')
+                    .css('background', 'rgba(139,195,74,.12)').css('border', '1px solid rgba(139,195,74,.4)').css('color', '#8bc34a');
+            }
+        } catch (e) { /* 忽略 */ }
     };
     eventSource.onerror = () => {
         if (connected) {
@@ -1062,8 +1776,34 @@ async function getMyExtInfo() {
 }
 async function showBridgeHelp() {
     bridgeHelpShown = true;
+    // 探测通道 → 刷新面板状态（每次通道变化都对齐：桥/无桥各自的检测结果）
+    const ch = await detectChannel();
+    try { applyChannelUI(ch === 'bridge' ? 'bridge' : 'st'); } catch (e) { /* 忽略 */ }
+    try { panelRefreshStatus(); } catch (e) { /* 忽略 */ }
+    // 顶部胶囊：无桥 → 「🟢 无桥模式·自动出图（ST 代理）」；恢复桥 → 「已绑定·自动出图」
+    try {
+        const $bs = $('#ta-img-bind');
+        if ($bs.length) {
+            if (ch === 'st') {
+                $bs.html('<span style="display:inline-flex;align-items:center;gap:6px;"><span style="width:8px;height:8px;border-radius:50%;background:#67e8f9;box-shadow:0 0 8px #67e8f9;animation:pulse 1.6s infinite;"></span>🟢 无桥模式 · 自动出图（ST 代理）</span>')
+                    .css('background', 'rgba(103,232,249,.12)').css('border', '1px solid rgba(103,232,249,.4)').css('color', '#67e8f9');
+            } else if (ch === 'bridge' && $bs.text().includes('无桥')) {
+                $bs.html('<span style="display:inline-flex;align-items:center;gap:6px;"><span style="width:8px;height:8px;border-radius:50%;background:#8bc34a;box-shadow:0 0 8px #8bc34a;animation:pulse 1.6s infinite;"></span>✅ 已绑定 · 自动出图</span>')
+                    .css('background', 'rgba(139,195,74,.12)').css('border', '1px solid rgba(139,195,74,.4)').css('color', '#8bc34a');
+            }
+        }
+    } catch (e) { /* 忽略 */ }
     const $h = $('#ta-img-bridge-help');
     if (!$h.length) {
+        if (ch === 'st') {
+            $('<div id="ta-img-bridge-help" style="background:rgba(139,195,74,.10);border:1px solid rgba(139,195,74,.45);border-radius:12px;padding:12px 14px;margin-bottom:10px;font-size:16px;color:#a5d6a7;">' +
+              '<div style="font-weight:700;margin-bottom:6px;">✅ 无桥模式已就绪（ST 原生代理）</div>' +
+              '<div style="line-height:1.7;">出图走：酒馆主 API（提示词工程）→ ComfyUI 代理 → 图片存酒馆。不需要装桥！<br>' +
+              '面板中依赖桥的项（模型目录 / LoRA 枚举 / API Key / 获取模型列表）已灰化，其余选项无桥直接可用。<br>' +
+              '可选：安装 install.bat 桥可获得 阶段提示/任务队列 等增强功能。</div>' +
+              '</div>').insertAfter($('#ta-img-card .list-group-item').first());
+            return;
+        }
         const myDir = await getMyExtInfo();
         $('<div id="ta-img-bridge-help" style="background:rgba(224,85,85,.10);border:1px solid rgba(224,85,85,.45);border-radius:12px;padding:12px 14px;margin-bottom:10px;font-size:16px;color:#ffb4b4;">' +
           '<div style="font-weight:700;margin-bottom:6px;">⚠️ 桥未启动（出图功能不可用）</div>' +
@@ -1094,6 +1834,7 @@ async function triggerOnce(msg) {
     if (msg.is_user || msg.is_system) return;
     if (seenMessages.has(msg.id)) return;
     seenMessages.add(msg.id);
+    pendingImgTarget = msg;   // 图片附加到这条角色回复下方（桥/无桥两端都设）
     if (seenMessages.size > 100) {
         const first = seenMessages.values().next().value;
         seenMessages.delete(first);
@@ -1101,6 +1842,28 @@ async function triggerOnce(msg) {
     const text = (msg.mes || msg.message || '').trim();
     if (!text) return;
     console.log('[tavern-auto-img] 收到角色回复, 触发自动文生图, id=', msg.id);
+    // 通道选择：桥活着 → 桥；桥没起 → ST 原生代理（无桥模式）；都没有 → 提示装桥
+    const channel = await detectChannel();
+    if (channel !== 'none') addImgPlaceholder(msg.id);   // 触发即占位（正在生成图…）
+    if (channel === 'st') {
+        // 无桥模式总开关（本地存储）：关闭时跳过并提示
+        if ((taGetLocalCfg().enabled ?? true) === false) {
+            toastr.warning('自动文生图总开关已关闭（⚡ 控制台顶栏开关），本次跳过出图', '自动文生图');
+            return;
+        }
+        try {
+            await generateViaST(text, msg.name || '角色');
+        } catch (e) {
+            console.error('[tavern-auto-img] 无桥模式失败:', e);
+            const stack = (e && e.stack ? e.stack.split('\n').slice(0, 4).map(s => s.trim()).join(' ← ') : (e?.message || '未知错误'));
+            showError({ message: (e?.message || '无桥模式出图失败') + ' | ' + stack });
+        }
+        return;
+    }
+    if (channel === 'none') {
+        showError({ message: '桥未启动，且 ComfyUI 代理不可用。请在控制台按提示装桥（install.bat）或检查 ComfyUI 地址' });
+        return;
+    }
     try {
         const resp = await fetch(BRIDGE + '/generate', {
             method: 'POST',
@@ -1150,6 +1913,16 @@ function bindMessageEvents() {
             if ($bs.length) {
                 $bs.html('<span style="display:inline-flex;align-items:center;gap:6px;"><span style="width:8px;height:8px;border-radius:50%;background:#8bc34a;box-shadow:0 0 8px #8bc34a;animation:pulse 1.6s infinite;"></span>✅ 已绑定 · 自动出图</span>');
                 $bs.css('background', 'rgba(139,195,74,.12)').css('border', '1px solid rgba(139,195,74,.4)').css('color', '#8bc34a');
+                // 无桥模式：胶囊追加通道标识（桥模式文本不变）
+                if (!connected) {
+                    detectChannel().then(ch => {
+                        const $b2 = $('#ta-img-bind');
+                        if (ch === 'st' && $b2.length) {
+                            $b2.html('<span style="display:inline-flex;align-items:center;gap:6px;"><span style="width:8px;height:8px;border-radius:50%;background:#67e8f9;box-shadow:0 0 8px #67e8f9;animation:pulse 1.6s infinite;"></span>🟢 无桥模式 · 自动出图（ST 代理）</span>')
+                                .css('background', 'rgba(103,232,249,.12)').css('border', '1px solid rgba(103,232,249,.4)').css('color', '#67e8f9');
+                        }
+                    });
+                }
             }
             toastr.success('事件触发已就绪（角色回复后自动出图）', '自动文生图');
             return true;

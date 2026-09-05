@@ -114,7 +114,7 @@ function ensureOverlay() {
     $head.append('<span id="ta-img-close" style="cursor:pointer;font-size:20px;color:#9aa;padding:4px 8px;border-radius:8px;">✕</span>');
     $card.append($head);
     $card.find('#ta-img-close').on('click', closePanel);
-    $('#ta-img-open-dir').off('click').on('click', async function () {
+    $card.find('#ta-img-open-dir').off('click').on('click', async function () {
         try {
             const r = await fetch(BRIDGE + '/open-dir', { method: 'POST' });
             const d = await r.json();

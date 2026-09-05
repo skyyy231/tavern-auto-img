@@ -20,6 +20,18 @@ tavern-auto-img-repo/
     └── make_recipe_templates.py   （可选：生成静态配方模板）
 ```
 
+## 安装方式（推荐：酒馆服务端插件，零 Python）
+
+1. 把 `bridge/tavern-auto-img-bridge.mjs` 复制到酒馆的 **`plugins/`** 目录
+2. 酒馆根目录 `config.yaml` 里：`enableServerPlugins: true`
+3. 重启酒馆 → **桥随酒馆自动运行**（监听 8645，日志：`data/default-user/tavern-auto-img/bridge.log`）
+4. 配置（可选）：`data/default-user/tavern-auto-img/config.json`（comfy_root / tavern_img_dir / tavern_data_dir）
+
+> 要求 Node 22+（酒馆默认环境即可）。无需 Python、无需独立启动、无需开机自启。
+
+## 安装方式（备选：独立 Python 桥）
+
+沿用 python 桥（详见下方"快速开始"）。二选一即可。
 ## 快速开始（3 步）
 
 **① 装酒馆扩展**：把 `extension/tavern-auto-img/` 整个文件夹拷进

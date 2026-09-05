@@ -54,7 +54,10 @@ DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
 DEFAULT_LLM = {"mode": "custom", "endpoint": "https://api.deepseek.com",
                "key": "", "model": "deepseek-chat"}
-GEN_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    GEN_DIR = os.path.dirname(os.path.abspath(sys.executable))   # PyInstaller exe 所在目录（含 config.json）
+else:
+    GEN_DIR = os.path.dirname(os.path.abspath(__file__))
 # ── 配置（发布版：从同目录 config.json 读取；文件不存在时按下方默认并提示）──
 import json as _json
 def _cfg(key, default):

@@ -1,0 +1,12 @@
+{
+    "display_name": "Tavern Auto Image",
+    "loading_order": 10,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "",
+    "author": "Hermes Skye",
+    "version": "1.0.0",
+    "homePage": "http://127.0.0.1:8645/",
+    "auto_update": false
+}

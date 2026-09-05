@@ -1,0 +1,6 @@
+{
+  "comfy_root": "F:/ComfyUI/ComfyUI",
+  "comfy_extra_paths": "F:/ComfyUI/ComfyUI/extra_model_paths.yaml",
+  "tavern_img_dir": "E:/jiuguan/SillyTavern/public/tavern-img",
+  "tavern_data_dir": "E:/jiuguan/SillyTavern/data/default-user"
+}

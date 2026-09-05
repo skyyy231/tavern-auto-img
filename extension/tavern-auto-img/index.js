@@ -110,9 +110,20 @@ function ensureOverlay() {
             .append('<div style="width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,#4158d0,#6a5af9);display:flex;align-items:center;justify-content:center;font-size:23px;box-shadow:0 6px 18px rgba(80,90,220,.45);">⚡</div>')
             .append('<div><div style="font-size:19px;font-weight:700;letter-spacing:.5px;background:linear-gradient(90deg,#818cf8,#38bdf8);-webkit-background-clip:text;background-clip:text;color:transparent;">自动文生图控制台</div><div style="font-size:12px;color:rgba(230,230,242,.55);margin-top:2px;">角色回复 → 提示词 → ComfyUI 出图</div></div>')
             .append('<span id="ta-img-bind" style="display:inline-flex;align-items:center;gap:6px;background:rgba(251,191,36,.10);border:1px solid rgba(251,191,36,.4);color:#fbbf24;font-size:13px;padding:4px 10px;border-radius:999px;">⌛ 联动检测中…</span>'));
+    $head.append('<span id="ta-img-open-dir" title="打开扩展文件夹（找桥文件/install.bat）" style="cursor:pointer;font-size:14px;color:#7dd3fc;padding:4px 8px;border-radius:8px;border:1px solid rgba(125,211,252,.35);margin-right:8px;">📂 扩展目录</span>');
     $head.append('<span id="ta-img-close" style="cursor:pointer;font-size:20px;color:#9aa;padding:4px 8px;border-radius:8px;">✕</span>');
     $card.append($head);
     $card.find('#ta-img-close').on('click', closePanel);
+    $('#ta-img-open-dir').off('click').on('click', async function () {
+        try {
+            const r = await fetch(BRIDGE + '/open-dir', { method: 'POST' });
+            const d = await r.json();
+            if (!d.ok) throw new Error(d.error || '');
+            toastr.info('已打开扩展文件夹（若没弹出请检查系统）', '自动文生图');
+        } catch (e) {
+            toastr.error('无法打开（桥未启动？）——扩展文件夹在：酒馆/data/default-user/extensions/', '自动文生图');
+        }
+    });
     const $host = $('<div id="ta-img-panel-host" style="display:flex;flex-direction:column;gap:6px;"></div>');
     $card.append($host);
     $ov.append($card);
@@ -1031,9 +1042,9 @@ function showBridgeHelp() {
           '<div style="font-weight:700;margin-bottom:6px;">⚠️ 桥未启动（出图功能不可用）</div>' +
           '<div style="margin-bottom:8px;line-height:1.7;">桥 = 发动机，随酒馆自动运行。没检测到它可能还没安装：</div>' +
           '<ol style="margin:0 0 8px 18px;line-height:1.7;">' +
-          '<li>下载一键安装包：<a href="https://github.com/skyyy231/tavern-auto-img/releases/download/v1.1.0/tavern-auto-img-%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85.zip" target="_blank" style="color:#7dd3fc;">点我下载（安装包）</a></li>' +
-          '<li>把 install.bat 放进酒馆根目录，双击，输 Y 自动重启</li>' +
-          '<li>再刷新本页面，这条提示会自动消失</li>' +
+          '<li>桥文件已随本扩展下载好了（扩展目录 bridge/ 里）</li>' +
+          '<li>打开扩展文件夹里的 <b>install.bat</b> 双击（即本项目仓库根目录，随安装下载的），它会自动：复制桥到 plugins/ + 开开关 + 问你要不要重启酒馆</li>' +
+          '<li>完成后强刷本页面，这条提示自动消失</li>' +
           '</ol>' +
           '</div>').insertAfter($('#ta-img-card .list-group-item').first());
     }

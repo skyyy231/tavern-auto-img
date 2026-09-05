@@ -104,7 +104,7 @@ function ensureOverlay() {
     } catch (e) { /* 忽略 */ }
     const $ov = $('<div id="ta-img-ov" style="position:fixed;inset:0;z-index:9999;display:none;background:rgba(0,0,0,.55);align-items:center;justify-content:center;"></div>')
         .on('click', function (e) { if (e.target === this) closePanel(); });
-    const $card = $('<div id="ta-img-card" style="width:min(760px,94vw);max-height:88vh;overflow-y:auto;background:linear-gradient(165deg,#14151f 0%,#191c2b 55%,#121320 100%);border:1px solid rgba(255,255,255,.09);border-radius:18px;padding:0 0 16px;box-shadow:0 30px 90px rgba(0,0,0,.7),inset 0 1px 0 rgba(255,255,255,.06);"></div>');
+    const $card = $('<div id="ta-img-card" style="width:min(720px,92vw);max-width:calc(100vw - 24px);max-height:calc(100vh - 48px);overflow:auto;background:linear-gradient(165deg,#14151f 0%,#191c2b 55%,#121320 100%);border:1px solid rgba(255,255,255,.09);border-radius:18px;padding:0 0 16px;box-shadow:0 30px 90px rgba(0,0,0,.7),inset 0 1px 0 rgba(255,255,255,.06);"></div>');
     const $head = $('<div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px 12px;border-bottom:1px solid rgba(255,255,255,.06);background:linear-gradient(90deg,rgba(129,140,248,.10),rgba(56,189,248,.06));"></div>')
         .append($('<div style="display:flex;align-items:center;gap:12px;"></div>')
             .append('<div style="width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,#4158d0,#6a5af9);display:flex;align-items:center;justify-content:center;font-size:23px;box-shadow:0 6px 18px rgba(80,90,220,.45);">⚡</div>')
@@ -160,7 +160,7 @@ function ensureOverlay() {
 
 function openPanel() { $('#ta-img-ov').css('display', 'flex'); }
 function closePanel() { $('#ta-img-ov').css('display', 'none'); }
-$(document).on('keydown.taov', function (e) { if (e.key === 'Escape') closePanel(); });
+$(document).on('keydown.taov', function (e) { if (e.key === 'Escape') { $('#tavern-img-loras-pop').hide(); closePanel(); } });
 
 // ── 设置 UI（ST 扩展设置区只留一个"打开控制台"入口，面板本体在浮层里）──
 function buildSettingsUI() {
@@ -213,7 +213,7 @@ function buildPanelUI($host) {
     const $rowLora = mkRow('fa-layer-group', '⑤ LoRA 选择（不勾也行，非必须项）：');
     const $btnLoraRefresh = $('<button id="tavern-img-loras-refresh" class="menu_button" style="min-width:70px;white-space:nowrap;">🔄 刷新 LoRA</button>');
     const $loraToggle = $('<button id="tavern-img-loras-open" class="menu_button" style="min-width:170px;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">LoRA：已选 0</button>');
-    const $loraPop = $('<div id="tavern-img-loras-pop" style="display:none;position:absolute;z-index:1300;background:#26262e;border:1px solid #666;border-radius:6px;padding:6px;max-height:340px;overflow-y:auto;min-width:320px;box-shadow:0 8px 20px rgba(0,0,0,.55);"></div>');
+    const $loraPop = $('<div id="tavern-img-loras-pop" style="display:none;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2200;background:#171927;border:1px solid rgba(255,255,255,.16);border-radius:12px;padding:8px 10px;max-height:72vh;overflow-y:auto;width:min(620px,92vw);box-shadow:0 24px 70px rgba(0,0,0,.75);"></div>');
     const $loraBox = $('<div id="tavern-img-loras" style="display:flex;flex-direction:column;gap:2px;"></div>');
     $loraPop.append($loraBox);
     const $loraChips = $('<div id="tavern-img-lora-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;width:100%;"></div>');
@@ -241,8 +241,7 @@ function buildPanelUI($host) {
         e.stopPropagation();
         const shown = $loraPop.is(':visible');
         if (shown) { $loraPop.hide(); return; }
-        const r = $loraToggle.offset();
-        $loraPop.css({ top: (r.top + $loraToggle.outerHeight() + 4) + 'px', left: r.left + 'px' }).show();
+        $loraPop.show();
     });
     $(document).off('click.tavernimg').on('click.tavernimg', function (e) {
         if ($loraPop.is(':visible') && !$(e.target).closest('#tavern-img-loras-pop, #tavern-img-loras-open').length) {

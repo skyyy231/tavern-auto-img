@@ -985,11 +985,16 @@ function connect() {
     eventSource.onopen = () => {
         connected = true;
         console.log('[tavern-auto-img] 已连接桥接服务', BRIDGE + '/events');
+        $('#ta-img-bridge-help').remove();   // 桥活了 → 清除安装引导
     };
     eventSource.onerror = () => {
         if (connected) {
             console.warn('[tavern-auto-img] 连接断开，尝试重连...');
             connected = false;
+            showBridgeHelp();
+        } else {
+            // 从未连接成功 → 桥可能没装/没起：给一键安装引导
+            if (!bridgeHelpShown) showBridgeHelp();
         }
     };
     eventSource.onmessage = (evt) => {
@@ -1014,6 +1019,24 @@ function connect() {
             showImage(data);
         }
     };
+}
+
+// ── 桥未启动引导：控制台顶部显示一键安装 ──
+let bridgeHelpShown = false;
+function showBridgeHelp() {
+    bridgeHelpShown = true;
+    const $h = $('#ta-img-bridge-help');
+    if (!$h.length) {
+        $('<div id="ta-img-bridge-help" style="background:rgba(224,85,85,.10);border:1px solid rgba(224,85,85,.45);border-radius:12px;padding:12px 14px;margin-bottom:10px;font-size:16px;color:#ffb4b4;">' +
+          '<div style="font-weight:700;margin-bottom:6px;">⚠️ 桥未启动（出图功能不可用）</div>' +
+          '<div style="margin-bottom:8px;line-height:1.7;">桥 = 发动机，随酒馆自动运行。没检测到它可能还没安装：</div>' +
+          '<ol style="margin:0 0 8px 18px;line-height:1.7;">' +
+          '<li>下载一键安装包：<a href="https://github.com/skyyy231/tavern-auto-img/releases/download/v1.1.0/tavern-auto-img-%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85.zip" target="_blank" style="color:#7dd3fc;">点我下载（安装包）</a></li>' +
+          '<li>把 install.bat 放进酒馆根目录，双击，输 Y 自动重启</li>' +
+          '<li>再刷新本页面，这条提示会自动消失</li>' +
+          '</ol>' +
+          '</div>').insertAfter($('#ta-img-card .list-group-item').first());
+    }
 }
 
 // ── v3 事件触发：角色回复完成 → 提示词工程 → 出图 ──────────────

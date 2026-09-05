@@ -111,6 +111,7 @@ function ensureOverlay() {
             .append('<div><div style="font-size:19px;font-weight:700;letter-spacing:.5px;background:linear-gradient(90deg,#818cf8,#38bdf8);-webkit-background-clip:text;background-clip:text;color:transparent;">自动文生图控制台</div><div style="font-size:12px;color:rgba(230,230,242,.55);margin-top:2px;">角色回复 → 提示词 → ComfyUI 出图</div></div>')
             .append('<span id="ta-img-bind" style="display:inline-flex;align-items:center;gap:6px;background:rgba(251,191,36,.10);border:1px solid rgba(251,191,36,.4);color:#fbbf24;font-size:13px;padding:4px 10px;border-radius:999px;">⌛ 联动检测中…</span>'));
     $head.append('<span id="ta-img-open-dir" title="打开扩展文件夹（找桥文件/install.bat）" style="cursor:pointer;font-size:14px;color:#7dd3fc;padding:4px 8px;border-radius:8px;border:1px solid rgba(125,211,252,.35);margin-right:8px;">📂 扩展目录</span>');
+    $head.append('<span id="ta-img-uninstall" title="卸载自动文生图桥（关闭出图引擎）&#10;&#10;点击后：&#10;① 删除酒馆 plugins 里的桥文件&#10;② 关闭 config.yaml 的 enableServerPlugins&#10;③ 自动重启酒馆。&#10;&#10;扩展本体保留不删；重新启用 = 运行扩展目录里的 install.bat。" style="cursor:pointer;font-size:14px;color:#f87171;padding:4px 8px;border-radius:8px;border:1px solid rgba(248,113,113,.4);margin-right:8px;">🧹 卸载桥</span>');
     $head.append('<span id="ta-img-close" style="cursor:pointer;font-size:20px;color:#9aa;padding:4px 8px;border-radius:8px;">✕</span>');
     $card.append($head);
     $card.find('#ta-img-close').on('click', closePanel);
@@ -122,6 +123,17 @@ function ensureOverlay() {
             toastr.info('已打开扩展文件夹（若没弹出请检查系统）', '自动文生图');
         } catch (e) {
             toastr.error('无法打开（桥未启动？）——扩展文件夹在：酒馆/data/default-user/extensions/', '自动文生图');
+        }
+    });
+    $card.find('#ta-img-uninstall').off('click').on('click', async function () {
+        if (!confirm('确定卸载桥？\n\n将执行：\n① 删除酒馆 plugins 里的桥文件\n② 关闭 enableServerPlugins\n③ 自动重启酒馆\n\n扩展本体保留；重新启用 = 双击扩展目录里的 install.bat。')) return;
+        try {
+            const r = await fetch(BRIDGE + '/uninstall', { method: 'POST' });
+            const d = await r.json();
+            if (d.ok) { toastr.success('桥已卸载，酒馆正在自动重启…（稍后刷新页面即可，出图功能已关闭）', '自动文生图'); }
+            else { toastr.error('卸载失败：' + (d.error || ''), '自动文生图'); }
+        } catch (e) {
+            toastr.error('无法连接桥，请先确认桥已启动', '自动文生图');
         }
     });
     const $host = $('<div id="ta-img-panel-host" style="display:flex;flex-direction:column;gap:6px;"></div>');

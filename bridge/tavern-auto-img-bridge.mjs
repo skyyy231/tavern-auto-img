@@ -554,6 +554,7 @@ const server = http.createServer(async (req, res) => {
                     const ourExt = [
                         path.join(cwd0, 'data', 'default-user', 'extensions', 'tavern-auto-img-extension'),
                         path.join(cwd0, 'data', 'default-user', 'extensions', 'TavernAutoImage'),
+                        path.join(cwd0, 'public', 'scripts', 'extensions', 'third-party', 'tavern-auto-img-extension'),
                         path.join(cwd0, 'public', 'scripts', 'extensions', 'third-party', 'tavern-auto-img'),
                     ].find(p0 => fs.existsSync(p0));
                     const userExtDir = path.join(cwd0, 'data', 'default-user', 'extensions');
@@ -565,6 +566,28 @@ const server = http.createServer(async (req, res) => {
                         ch.unref();
                     }
                     return jsonReply(res, { ok: true, dir: d });
+                } catch (e) { return jsonReply(res, { ok: false, error: String(e.message || e) }); }
+            }
+            if (p === '/uninstall') {
+                // 卸载桥：删除 plugins 里的桥文件 + 关闭 enableServerPlugins + 自动重启酒馆
+                try {
+                    const pf = path.join(process.cwd(), 'plugins', 'tavern-auto-img-bridge.mjs');
+                    let removed = false;
+                    if (fs.existsSync(pf)) { fs.rmSync(pf, { force: true }); removed = true; }
+                    const cfgP = path.join(process.cwd(), 'config.yaml');
+                    let cfgClosed = false;
+                    if (fs.existsSync(cfgP)) {
+                        const c = fs.readFileSync(cfgP, 'utf8');
+                        const c2 = c.replace(/enableServerPlugins:\s*true/, 'enableServerPlugins: false');
+                        if (c2 !== c) { fs.writeFileSync(cfgP, c2, 'utf8'); cfgClosed = true; }
+                    }
+                    // 异步重启酒馆（本桥随酒馆进程一起结束）
+                    const { spawn } = await import('node:child_process');
+                    const me = process.pid;
+                    const ps = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command',
+                        `Start-Sleep 2; Stop-Process -Id ${me} -Force -ErrorAction SilentlyContinue; Start-Sleep 1; Start-Process -FilePath 'node' -ArgumentList 'server.js' -WorkingDirectory '${process.cwd()}' -WindowStyle Hidden`], { detached: true, stdio: 'ignore' });
+                    ps.unref();
+                    return jsonReply(res, { ok: true, removed, config_closed: cfgClosed, restart: true });
                 } catch (e) { return jsonReply(res, { ok: false, error: String(e.message || e) }); }
             }
             if (p === '/cancel') {

@@ -267,7 +267,11 @@ async function generateViaST(text, name, lock) {
     comfyUrl = comfyUrl.replace(/\/+$/, '');
 
     toastr.info('🤖 提示词生成中…（无桥模式·走酒馆主 API）', '自动文生图');
-    const pr = await stEngineer(text, family, myEpoch).catch(e => { throw new Error('提示词生成失败:' + e.message); });
+    // ⭐ 被接管（AbortError）原样抛（triggerOnce 静默）；其它失败才包前缀
+    const pr = await stEngineer(text, family, myEpoch).catch(e => {
+        if (e && e.name === 'AbortError') throw e;
+        throw new Error('提示词生成失败:' + e.message);
+    });
     if (taGenEpoch !== myEpoch) { const e = new Error('任务已被接管'); e.name = 'AbortError'; throw e; }   // ⭐ 纪元自查
     const negative = 'bad quality, worst quality, lowres, blurry, extra limbs, deformed hands, text, watermark'
         + (pr.male ? ', female, woman, girl, big breasts, cleavage, westerner, caucasian' : '');
@@ -434,7 +438,7 @@ function taRerunPrompt() {
         } catch (e) {
             console.error('[tavern-auto-img] 重新生成失败:', e);
             taLogRun({ status: '❌ 重跑失败', error: (e?.message || '未知错误') }, true);
-            if (!(e && (e.name === 'AbortError' || /abort/i.test(String(e.message || ''))))) {
+            if (!(e && (e.name === 'AbortError' || /abort|已被接管/i.test(String(e.message || ''))))) {
                 showError({ message: '重新生成提示词失败：' + (e?.message || '未知错误') });
             }
         } finally {
@@ -2490,11 +2494,11 @@ async function triggerOnce(msg, overrideText, lockIn) {
             // 任务锁已在上方构建（含楼层锚 el）
             await generateViaST(text, msg.name || '角色', lock);
         } catch (e) {
-            // 被中断（重roll/编辑/急停）→ 静默，不弹红框
-            if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')))) {
-                removeImgPlaceholder();
+            // 被中断（重roll/编辑/急停/被接管）→ 静默，不弹红框
+            if (e && (e.name === 'AbortError' || /abort|已被接管/i.test(String(e.message || '')))) {
+                removeImgPlaceholder(lock.el);
                 taLogRun({ status: '⏹ 已中断', error: '用户重roll/编辑/急停' }, true);
-                console.info('[tavern-auto-img] 任务已中断（用户重roll/编辑）');
+                console.info('[tavern-auto-img] 任务已中断（用户重roll/编辑/接管）');
                 return;
             }
             console.error('[tavern-auto-img] 无桥模式失败:', e);

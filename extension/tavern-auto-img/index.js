@@ -2758,7 +2758,8 @@ function bindMessageEvents() {
 }
 
 function init() {
-    console.log('[tavern-auto-img] 初始化 v3.0...');
+    console.log('[tavern-auto-img] 初始化 v3.0...');   // ⭐ 版号验证：v3.0-dca1974 = max_tokens 3000 已生效；没这行或旧串 = 页面在跑旧 JS（缓存），Ctrl+Shift+R 或换无痕窗口
+    console.log('[tavern-auto-img] v3.0-dca1974 (max_tokens=3000, reasoning修复)');
     ensureOverlay();          // 右下角 ⚡ + 控制台浮层（面板本体在此）
     buildSettingsUI();        // 设置区只留"打开控制台"入口
     connect();

@@ -155,7 +155,7 @@ async function stEngineer(text, family, myKill) {
         chat_completion_source: 'custom',
         custom_url: llmEndpoint,
         model: llmModel,
-        max_tokens: 1200,
+        max_tokens: 3000,   // ⭐ 3000：OpenClaw 内核是 reasoning 模型（思考常吃 800+ token）——1200 会思考完就没内容→"LLM返回空内容"→3次全败（2026-09-08 实测：3000 时 content=830 正常）
         temperature: 0.8,
         stream: false,
     };

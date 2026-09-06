@@ -252,29 +252,86 @@ async function generateViaST(text, name, lock) {
         ? applyWfCustom(wfCfg.wf, pr.positive, negative)
         : stBuildWorkflow(modelFile, family, lorasArr, sizeMult, stepsMult, pr.positive, negative);
 
+    // ── 直连 ComfyUI：POST /prompt → WS 事件等完成 → /history 取图（零轮询）──
     stAbort = new AbortController();
-    const r = await fetch('/api/sd/comfy/generate', {
+    const clientId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const r = await fetch(comfyUrl + '/prompt', {
         method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify({ url: comfyUrl, prompt: '{ "prompt": ' + JSON.stringify(wf) + ' }' }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: wf, client_id: clientId }),
         signal: stAbort.signal,
     });
-    console.log('[ta-img][st] ⑤ 代理返回', r.status);
+    console.log('[ta-img][st] ⑤ 直连提交 ComfyUI /prompt', r.status);
     if (!r.ok) {
         const t = await r.text().catch(() => '');
-        throw new Error('ComfyUI(代理) 失败: ' + t.slice(0, 200));
+        throw new Error('ComfyUI 提交失败: ' + t.slice(0, 200));
     }
-    const result = await r.json();
-    if (!result.data) throw new Error('ComfyUI 未返回图片数据');
-    console.log('[ta-img][st] ⑥ 拿到 base64，上传中…', result.format);
-    const fmt = (result.format || 'png').toLowerCase();
+    const sub = await r.json();
+    const pid = sub.prompt_id;
+    if (!pid) throw new Error('ComfyUI 未返回 prompt_id');
+    await waitComfyDirect(comfyUrl, pid, clientId, stAbort.signal, 240000);   // 事件驱动（WS），非轮询
+    // 完成后一次性 /history 取图
+    const hist = await (await fetch(comfyUrl + '/history/' + pid, { signal: stAbort.signal })).json();
+    const node = (hist[pid] || {});
+    let imgMeta = null;
+    for (const [_nid, nout] of Object.entries(node.outputs || {})) {
+        const imgs = nout.images || [];
+        if (imgs && imgs.length) { imgMeta = imgs[0]; break; }
+    }
+    if (!imgMeta) throw new Error('完成但未找到输出图');
+    const vUrl = comfyUrl + '/view?' + new URLSearchParams({ filename: imgMeta.filename, subfolder: imgMeta.subfolder || '', type: imgMeta.type || 'output' });
+    const vr = await fetch(vUrl, { signal: stAbort.signal });
+    if (!vr.ok) throw new Error('取图失败 HTTP ' + vr.status);
+    const buf = await vr.arrayBuffer();
+    console.log('[ta-img][st] ⑥ 直连拿到 base64，上传中…');
+    const fmt = ((imgMeta.filename || '').match(/\.([a-z0-9]+)$/i)?.[1] || 'png').toLowerCase();
     const fname = 'tavern_auto_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-    const url = await saveBase64AsFile(result.data, (name || '生图').replace(/[\\/]/g, '_'), fname, fmt);
+    const url = await saveBase64AsFile(bufToBase64(buf), (name || '生图').replace(/[\\/]/g, '_'), fname, fmt);
     console.log('[ta-img][st] ⑦ 上传成功，url =', url);
     taLogRun({ status: '✅ 成功', secs: Math.round((Date.now() - runStart) / 1000), url: url }, true);
     showImage({ url: url, name: name, model: modelFile }, lock);
     console.log('[ta-img][st] ⑧ showImage 调用完成');
     return url;
+}
+
+/** 直连 ComfyUI WS：等自己的 prompt 完成（事件驱动；executing/executed/error 按 prompt_id 分流） */
+function waitComfyDirect(comfyUrl, pid, clientId, signal, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        let ws = null, done = false;
+        const timer = setTimeout(() => finish(new Error('生成超时（WS 无完成信号）'), true), timeoutMs);
+        const fin = (err) => { if (done) return; done = true; clearTimeout(timer); try { signal && signal.removeEventListener('abort', onAbort); } catch { /* 忽略 */ } try { ws && ws.close(); } catch { /* 忽略 */ } err ? reject(err) : resolve(); };
+        const onAbort = () => fin(new Error('已中断'));
+        if (signal) { if (signal.aborted) { fin(new Error('已中断')); return; } signal.addEventListener('abort', onAbort); }
+        function finish(err) { fin(err); }
+        try {
+            const wsUrl = comfyUrl.replace(/^http/, 'ws') + '/ws?clientId=' + encodeURIComponent(clientId);
+            ws = new WebSocket(wsUrl);
+            ws.onopen = () => console.log('[ta-img][st] WS 已连接（事件驱动，非轮询）', pid);
+            ws.onmessage = (evt) => {
+                let m; try { m = JSON.parse(evt.data); } catch { return; }
+                if (!m || !m.data) return;
+                if (m.type === 'executing' || m.type === 'progress' || m.type === 'executed') {
+                    if (m.data.prompt_id && m.data.prompt_id !== pid) return;   // 只认自己，天然不打架
+                }
+                if (m.type === 'execution_success' || m.type === 'execution_complete') { finish(); }
+                else if (m.type === 'executed' && m.data.output && m.data.output.images && m.data.output.images.length) { finish(); }   // 输出节点完成=有图
+                else if (m.type === 'execution_error') { finish(new Error('ComfyUI 执行错误：' + String(m.data?.exception_message || '').slice(0, 200))); }
+                else if (m.type === 'execution_interrupted') { finish(new Error('任务被中断')); }
+            };
+            ws.onerror = () => console.warn('[ta-img][st] WS 连接错误（若任务已提交，稍后走结束信号）');
+            ws.onclose = () => { /* 正常关闭由 finish 处理 */ };
+        } catch (e) { finish(new Error('WS 建立失败：' + (e.message || e))); }
+    });
+}
+/** ArrayBuffer → base64（浏览器） */
+function bufToBase64(buf) {
+    const bytes = new Uint8Array(buf);
+    let s = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+        s += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(s);
 }
 
 /** 通道探测：桥活着？返回 'bridge'；ST 代理可用？返回 'st'；全无 → 'none' */
@@ -733,57 +790,149 @@ function buildPanelUI($host) {
     $panel.append($rowSpeed);
 
     // ④ 模型目录自选（extra_model_paths 管理）
-    const $rowPaths = mkRow('fa-folder-open', '模型 / LoRA 目录（保存后重启 ComfyUI 生效）：');
-    const $inRoot = $('<input id="tavern-img-paths-root" class="text_pole" style="flex:1;min-width:120px;font-size:16px;" placeholder="模型根目录，如 D:/模型库">');
-    const $inLora = $('<input id="tavern-img-paths-lora" class="text_pole" style="flex:1;min-width:120px;font-size:16px;" placeholder="（可选）LoRA 目录">');
+    const $rowPaths = mkRow('fa-folder-open', '模型 / LoRA 目录：');
+    // 两个按钮（占位更小、无输入框）：点击弹出内置目录选择浮层
+    let taModelRoot = '', taLoraRoot = '';
+    const $btnRootPick = $('<button id="tavern-img-browse-model" class="menu_button" style="min-width:150px;font-size:16px;white-space:nowrap;" title="模型存放位置：模型/LoRA 文件下载到哪，就选哪">📂 模型存放位置</button>');
+    const $btnLoraPick = $('<button id="tavern-img-browse-lora" class="menu_button" style="min-width:150px;font-size:16px;white-space:nowrap;" title="LoRA 存放位置：上面是 ComfyUI 默认位置，点这里选">📂 LoRA 存放位置</button>');
     const $btnPaths = $('<button id="tavern-img-paths-save" class="menu_button" style="min-width:92px;font-size:15px;white-space:nowrap;">💾 保存</button>');
     const $btnRefresh = $('<button id="tavern-img-refresh-list" class="menu_button" style="min-width:92px;font-size:15px;white-space:nowrap;">🔄 刷新</button>');
     const $pathsHint = $('<span class="muted" style="margin-left:6px;font-size:15px;width:100%;"></span>');
-    const $pathsCloudHint = $('<span class="muted" style="font-size:14px;width:100%;margin-top:2px;">（云部署的 ComfyUI 无需配置目录：模型清单由云端服务器自动提供）</span>');
-    // 目录浏览按钮：调桥 GET /paths/dialog?kind=model|lora（Windows 文件夹选择器），选中即回填输入框
-    const mkBrowse = (kind) => $('<button id="tavern-img-browse-' + kind + '" class="menu_button" style="min-width:46px;font-size:15px;white-space:nowrap;" title="选择文件夹">📂</button>').on('click', async function () {
-        try {
-            const resp = await fetch(`${BRIDGE}/paths/dialog?kind=${kind}`);
-            const data = await resp.json();
-            if (data.ok && data.path) {
-                (kind === 'model' ? $inRoot : $inLora).val(data.path);
-            } else {
-                toastr.error(data.error || '未选择目录或选择器返回失败', '自动文生图');
-            }
-        } catch (e) {
-            toastr.error('打开目录选择器失败：' + (e?.message || e), '自动文生图');
-        }
+    const $pathsCloudHint = $('<span class="muted" style="font-size:14px;width:100%;margin-top:2px;">（模型/LoRA 下载到哪，就把存放位置选到哪；上方列表是 ComfyUI 默认位置）</span>');
+    const $inRoot = $('<input id="tavern-img-paths-root" type="hidden">');
+    const $inLora = $('<input id="tavern-img-paths-lora" type="hidden">');
+    function syncPathButtons() {
+        $btnRootPick.attr('title', '模型存放位置：' + (taModelRoot || '未设置（用 ComfyUI 默认）'));
+        $btnRootPick.css('color', taModelRoot ? '' : '#8a8f9e');
+        $btnLoraPick.attr('title', 'LoRA 存放位置：' + (taLoraRoot || '未设置（用 ComfyUI 默认）'));
+        $btnLoraPick.css('color', taLoraRoot ? '' : '#8a8f9e');
+        $inRoot.val(taModelRoot); $inLora.val(taLoraRoot);
+    }
+    syncPathButtons();
+    // 目录浏览按钮：改前端内置目录选择浮层（酒馆页面内，永远置顶；系统弹窗在后台进程下不可靠）
+    // 候选 = 桥 /list-models 枚举出的目录（去重） + 当前输入 + 手动输入
+    const $dirOv = $('<div id="ta-img-dir-ov" style="position:fixed;inset:0;z-index:10080;display:none;background:rgba(0,0,0,.65);align-items:center;justify-content:center;"></div>');
+    const $dirCard = $('<div style="background:#1c1f2e;border:1px solid rgba(129,140,248,.35);border-radius:16px;padding:18px 20px;width:min(560px,92vw);max-height:70vh;overflow:auto;color:#e8e8f2;"></div>');
+    const $dirTitle = $('<div style="font-size:20px;font-weight:700;margin-bottom:10px;color:#a5b4fc;">📁 模型/LoRA 放在哪？</div>');
+    const $dirList = $('<div style="margin:8px 0 12px;max-height:280px;overflow:auto;"></div>');
+    const $dirInput = $('<input class="text_pole" style="width:calc(100% - 8px);font-size:16px;padding:8px;border-radius:8px;margin-bottom:10px;" placeholder="这里填你模型/LoRA 下载的位置（如 F:/ComfyUI/ComfyUI/models）">');
+    const $dirBtns = $('<div style="display:flex;gap:10px;"></div>');
+    const $dirOk = $('<button class="menu_button" style="min-width:110px;font-size:16px;white-space:nowrap;">✅ 确定</button>');
+    const $dirCancel = $('<button class="menu_button" style="min-width:80px;font-size:16px;white-space:nowrap;">取消</button>');
+    $dirBtns.append($dirOk, $dirCancel);
+    $dirCard.append($dirTitle, $dirList, $dirInput, $dirBtns);
+    $dirOv.append($dirCard);
+    $panel.append($dirOv);
+    let dirPickTarget = null;   // 'model' | 'lora'
+    function openDirPicker(kind) {
+        dirPickTarget = kind;
+        const isModel = kind === 'model';
+        const what = isModel ? '模型' : 'LoRA';
+        $dirTitle.text('📁 ' + what + ' 放在哪？');
+        const hint = `⬇ 下面填你${what}下载的位置（⬆ 上面是 ComfyUI 的默认位置）`;
+        $dirList.empty();
+        $dirInput.val(isModel ? taModelRoot : taLoraRoot);
+        $dirList.append('<div class="muted" style="margin-bottom:8px;">正在枚举目录…</div>');
+        fetch(`${BRIDGE}/list-models?kind=${kind}`).then(r => r.json()).then(d => {
+            $dirList.empty();
+            const dirs = [...new Set((d.items || []).map(x => x.dir).filter(Boolean))];
+            if (!dirs.length) $dirList.append('<div class="muted">未枚举到目录（可用下面手动输入）</div>');
+            const pushDir = (dir, badge) => {
+                const $row = $('<div style="display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:10px;background:rgba(255,255,255,.04);margin-bottom:6px;cursor:pointer;font-size:16px;border:1px solid transparent;"></div>');
+                $row.on('mouseenter', () => $row.css('background', 'rgba(129,140,248,.15)'));
+                $row.on('mouseleave', () => $row.css('background', 'rgba(255,255,255,.04)'));
+                $row.on('click', () => { $dirInput.val(dir); });
+                $row.html(`<span style="word-break:break-all;flex:1;">📂 ${dir}</span>${badge ? '<span style="color:#8bc34a;white-space:nowrap;font-size:14px;">' + badge + '</span>' : ''}`);
+                $dirList.append($row);
+            };
+            dirs.forEach(dir => pushDir(dir, ''));
+            // 提示放中间：列表之后、输入框之前（⬆ 上=默认列表；⬇ 下=你填的位置）
+            $dirList.append('<div class="muted" style="margin:6px 0 4px;font-size:15px;">' + hint + '</div>');
+        }).catch(() => {
+            $dirList.empty().append('<div class="muted">枚举失败（桥未启动？）可用下面手动输入</div><div class="muted" style="margin:6px 0 4px;font-size:15px;">' + hint + '</div>');
+        });
+        $dirOv.css('display', 'flex');
+    }
+    $dirOv.on('click', function (e) { if (e.target === this) $dirOv.css('display', 'none'); });
+    $dirCancel.on('click', () => $dirOv.css('display', 'none'));
+    $dirOk.on('click', () => {
+        const v = $dirInput.val().trim();
+        if (!v) { toastr.error('请输入或选择目录', '自动文生图'); return; }
+        if (dirPickTarget === 'model') taModelRoot = v; else taLoraRoot = v;
+        syncPathButtons();
+        $dirOv.css('display', 'none');
+        toastr.success('目录已填入（💾 保存后生效）', '自动文生图');
     });
+    $btnRootPick.on('click', () => openDirPicker('model'));
+    $btnLoraPick.on('click', () => openDirPicker('lora'));
     // ①+② 三行式：Line1 模型根目录📂 / Line2 LoRA目录📂 / Line3 💾保存+🔄刷新+统计（每行 one-line，不挤不换）
     const $inRootWrap = $('<div style="display:flex;align-items:center;flex-wrap:nowrap;width:100%;margin-top:4px;"></div>');
     const $inLoraWrap = $('<div style="display:flex;align-items:center;flex-wrap:nowrap;width:100%;margin-top:4px;"></div>');
     const $btnsWrap = $('<div style="display:flex;align-items:center;flex-wrap:nowrap;width:100%;margin-top:4px;"></div>');
-    $inRootWrap.append($inRoot, mkBrowse('model'));
-    $inLoraWrap.append($inLora, mkBrowse('lora'));
-    $btnsWrap.append($btnPaths, $btnRefresh);
+    // 📥 选文件写入（桥 /upload-model）：浏览器选模型/LoRA 文件 → 流式写入所选目录
+    const $btnUpload = $('<button id="tavern-img-upload-model" class="menu_button" style="min-width:118px;font-size:15px;white-space:nowrap;" title="选择本地的模型/LoRA 文件，自动写入目录（桥按文件名判断类型：unet→diffusion_models、vae→vae、lora→loras…）">📥 选文件写入</button>');
+    const $fileIn = $('<input type="file" id="tavern-img-file" accept=".safetensors,.ckpt,.pt,.pth,.gguf" style="display:none">');
+    $fileIn.on('change', async function () {
+        const f = this.files && this.files[0];
+        this.value = '';
+        if (!f) return;
+        const kind = /lora|lycoris/i.test(f.name) ? 'lora' : 'model';
+        toastr.info('开始上传：' + f.name + '（' + Math.round(f.size / 1048576) + 'MB）…', '自动文生图');
+        try {
+            const resp = await fetch(`${BRIDGE}/upload-model?name=${encodeURIComponent(f.name)}&kind=${kind}`, { method: 'POST', body: f });
+            const d = await resp.json();
+            if (d.ok) { toastr.success('✅ 已写入：' + d.file + '（刷新模型/LoRA 列表即可看到）', '自动文生图'); }
+            else { toastr.error('写入失败：' + (d.error || '未知错误'), '自动文生图'); }
+        } catch (e) {
+            toastr.error('上传失败：' + (e?.message || e), '自动文生图');
+        }
+    });
+    $btnUpload.on('click', () => $fileIn.trigger('click'));
+    $inRootWrap.append($btnRootPick, $btnLoraPick);
+    $inLoraWrap.remove();
+    $btnsWrap.append($btnPaths, $btnRefresh, $btnUpload, $fileIn);
+    // 💾 保存：POST /paths（桥记录所选目录 → 枚举/上传以此为根）
+    $btnPaths.on('click', async function () {
+        try {
+            const resp = await fetch(BRIDGE + '/paths', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_root: taModelRoot, lora_dir: taLoraRoot }),
+            });
+            const d = await resp.json();
+            if (d.ok) { toastr.success('目录已保存（枚举/上传以此为根；ComfyUI 需重启才加载新目录）', '自动文生图'); }
+            else { toastr.error('保存失败：' + (d.error || ''), '自动文生图'); }
+        } catch (e) { toastr.error('保存失败：' + (e?.message || e), '自动文生图'); }
+    });
+    // 🔄 刷新：同时刷 /list-models（按用户目录枚举）与 /model
+    $btnRefresh.on('click', async function () {
+        try {
+            const [mr, lr] = await Promise.all([
+                fetch(`${BRIDGE}/list-models?kind=model`).then(r => r.json()).catch(() => null),
+                fetch(`${BRIDGE}/list-models?kind=lora`).then(r => r.json()).catch(() => null),
+            ]);
+            const nModel = mr && mr.ok ? (mr.items || []).length : 0;
+            const nLora = lr && lr.ok ? (lr.items || []).length : 0;
+            $pathsHint.text(`枚举：模型 ${nModel} · LoRA ${nLora}`).css('color', '#8bc34a');
+            // 同时刷新动态模型列表（/model 自动发现，与目录枚举一致）
+            try {
+                const mresp = await fetch(BRIDGE + '/model?refresh=1');
+                const mdata = await mresp.json();
+                if (Array.isArray(mdata.auto_models) && mdata.auto_models.length) {
+                    currentAutoModels = mdata.auto_models;
+                    $autoSel.empty().append('<option value="">未选择</option>');
+                    mdata.auto_models.forEach(m => { $autoSel.append(`<option value="${m.file}">${m.label || m.file}</option>`); });
+                    $rowAuto.show();
+                }
+            } catch (e) { /* 忽略 */ }
+            toastr.success(`已按目录枚举：模型 ${nModel} 个 · LoRA ${nLora} 个`, '自动文生图');
+        } catch (e) { toastr.error('枚举失败：' + (e?.message || e), '自动文生图'); }
+    });
+
     $rowPaths.append($inRootWrap, $inLoraWrap, $btnsWrap, $pathsHint, $pathsCloudHint);
     $rowPaths.find('input,button').css('margin-right', '6px');
     $panel.append($rowPaths);
 
-    $btnRefresh.on('click', async function () {
-        try {
-            const resp = await fetch(BRIDGE + '/model?refresh=1');
-            const data = await resp.json();
-            if (Array.isArray(data.auto_models) && data.auto_models.length) {
-                currentAutoModels = data.auto_models;
-                $autoSel.empty().append('<option value="">未选择</option>');
-                data.auto_models.forEach(m => {
-                    $autoSel.append(`<option value="${m.file}">${m.label || m.file}</option>`);
-                });
-                $rowAuto.show();
-                toastr.success(`已刷新：自动发现模型 ${data.auto_models.length} 个`, '自动文生图');
-            } else {
-                toastr.warning('刷新完成，但 ComfyUI 未返回模型（检查服务/目录）', '自动文生图');
-            }
-        } catch (e) {
-            toastr.error('刷新失败：' + (e?.message || e), '自动文生图');
-        }
-    });
+    // （模型自动发现刷新已并入上方 🔄 刷新 handler）
 
     // ⑤ 服务配置：ComfyUI 地址（GET/POST 8645/config）
     const $rowCfg = mkRow('fa-server', 'ComfyUI 地址：');
@@ -1356,7 +1505,33 @@ function buildPanelUI($host) {
                     } catch (e) { /* 忽略 */ }
                     $select.empty().append('<option value="">无桥模式（模型在右侧动态列表）</option>');
                 } else {
-                    $select.empty().append('<option value="">桥接服务未连接</option>');
+                    // ST 代理 500/不可用 → 前端直连 ComfyUI /object_info（CORS 已开；无桥真·直连）
+                    try {
+                        const oiResp = await fetch(comfyUrl.replace(/\/+$/, '') + '/object_info', { signal: AbortSignal.timeout(15000) });
+                        if (oiResp.ok) {
+                            const oi = await oiResp.json();
+                            const ckpts = oi?.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0] || [];
+                            const unets = oi?.UNETLoader?.input?.required?.unet_name?.[0] || [];
+                            const ggufs = oi?.UnetLoaderGGUF?.input?.required?.unet_name?.[0] || [];
+                            const raw = [...ckpts.map(x => ({ value: x, text: x })), ...unets.map(x => ({ value: x, text: 'UNet: ' + x })), ...ggufs.map(x => ({ value: x, text: 'GGUF: ' + x }))];
+                            const recs = raw.map(m => ({ file: m.value, family: stDetectFamily(m.value), label: (m.text || m.value).replace(/\.[^.]*$/, '').replace(/_/g, ' ') }));
+                            currentAutoModels = recs;
+                            $rowAuto.show();
+                            $autoSel.empty().append('<option value="">未选择</option>');
+                            recs.forEach(m => { $autoSel.append(`<option value="${m.file}">${m.label || m.file}</option>`); });
+                            const saved = JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}').auto_model || '';
+                            if (saved && recs.some(m => m.file === saved)) $autoSel.val(saved);
+                            else { const fast = recs.find(m => m.family === 'sdxl') || recs[0]; if (fast) $autoSel.val(fast.file); }
+                            const cur = $autoSel.val();
+                            if (cur) {
+                                const rec = recs.find(m => m.file === cur);
+                                $autoHint.text(rec ? `家族：${rec.family || '-'}` : '');
+                                localStorage.setItem('taImgLocalCfg', JSON.stringify({ ...(JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}')), auto_model: cur }));
+                            }
+                            try { const lc = JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}'); if (lc.size_mult != null) $sizeSel.val(String(lc.size_mult)); if (lc.steps_mult != null) $stepsSel.val(String(lc.steps_mult)); } catch (e) { /* 忽略 */ }
+                            $select.empty().append('<option value="">无桥模式（模型在右侧动态列表）</option>');
+                        } else { $select.empty().append('<option value="">桥接服务未连接</option>'); }
+                    } catch (e2) { $select.empty().append('<option value="">桥接服务未连接</option>'); }
                 }
             } catch (e2) {
                 $select.empty().append('<option value="">桥接服务未连接</option>');
@@ -1756,14 +1931,18 @@ function buildPanelUI($host) {
     // ── 通道状态切换（无桥模式灰化依赖桥的能力 + 中文说明；桥模式恢复原样）──
     applyChannelUI = function (ch) {
         const noBridge = (ch === 'st' || ch === 'none');
-        // ① 模型/LoRA 目录：需要桥写 extra_model_paths；无桥 → 灰化 + 说明
-        $rowPaths.css('opacity', noBridge ? '0.5' : '');
+        // ① 模型/LoRA 目录：只有桥能写盘；无桥 → 整行隐藏（傻瓜化：不显示用不了的东西）
+        if (noBridge) {
+            $rowPaths.hide();
+        } else {
+            $rowPaths.show();
+        }
         $inRoot.prop('disabled', noBridge);
         $inLora.prop('disabled', noBridge);
         $btnPaths.prop('disabled', noBridge);
         $btnRefresh.prop('disabled', noBridge);
         $rowPaths.find('#tavern-img-browse-model, #tavern-img-browse-lora').prop('disabled', noBridge);
-        $pathsCloudHint.text(noBridge ? '（无桥模式：模型清单由 ComfyUI 自动枚举，目录设置仅桥/本地 ComfyUI 需要）' : '（云部署的 ComfyUI 无需配置目录：模型清单由云端服务器自动提供）');
+        $pathsCloudHint.text(noBridge ? '（模型/LoRA 下载到哪，就把存放位置选到哪；上方列表是 ComfyUI 默认位置）' : '（云部署的 ComfyUI 无需配置目录：模型清单由云端服务器自动提供）');
         // ③ API Key：无桥可填（存酒馆密钥库后隐藏）；不填则用酒馆主 API 密钥
         $inLlmKey.prop('disabled', false)
             .attr('title', '选填：填入后自动存入酒馆密钥库（隐藏存储），提示词请求即用此 key；不填则沿用酒馆主 API 的密钥')
@@ -1772,6 +1951,13 @@ function buildPanelUI($host) {
         $btnLlmModels.prop('disabled', false)
             .attr('title', '从该 API 获取模型列表（无桥模式：走酒馆代理，读你已存的 key）');
         // ⑧ 自定义工作流按钮区域不需要灰化（无桥也支持，见本地存储）
+        // 辅助行瘦身：无桥 → 只留 📋出图日志（隐藏 扩展目录/卸载桥/桥安装指南）
+        if (noBridge) {
+            $rowAux.find('#ta-img-open-dir2, #ta-img-uninstall2, #ta-img-guide2').hide();
+            $rowAux.find('#ta-img-log2').show();
+        } else {
+            $rowAux.find('#ta-img-open-dir2, #ta-img-uninstall2, #ta-img-guide2').show();
+        }
         // ⑤ LoRA：无桥 → 先自动枚举（同桥勾选 UI）；失败才手动输入
         if (noBridge) {
             $btnLoraRefresh.prop('disabled', false);
@@ -1949,8 +2135,9 @@ function buildPanelUI($host) {
         '① 打开总开关（上方）→ 聊天里角色每次回复自动配图；' +
         '② 模型可在「模型选择」里换（没选也行，自动挑稳定模型）；' +
         '③ 出图耗时 30 秒~几分钟，图直接落在回复下方；' +
-        '④ 失败看红色提示，或点「停止任务」中断。' +
-        '<span style="color:rgba(230,230,242,.45);">（提示词走酒馆主 API；无桥模式零安装直接出图）</span>'
+        '④ 失败看红色提示，或点「停止任务」中断；' +
+        '⑤ 模型/LoRA 放哪：ComfyUI 的 <b>models/checkpoints</b>（底模）、<b>models/diffusion_models</b>（Unet）、<b>models/loras</b>（LoRA）——下载好的文件丢进对应文件夹，刷新即可见。' +
+        '<span style="color:rgba(230,230,242,.45);">（无桥模式：零安装，直连 ComfyUI 出图；模型/LoRA 由 ComfyUI 自动枚举）</span>'
     );
 
     // 按用户指定顺序重排（DOM 移动，不影响引用）：
@@ -1966,6 +2153,55 @@ function buildPanelUI($host) {
 }
 
 // ── SSE 连接 ────────────────────────────────────────────────
+// 桥任务挂起管理器（双保险串行：桥 job 异步结果经由 SSE 带 job id 回传）
+const taPendingJobs = new Map();   // jobId -> {resolve, reject, timer}
+function waitBridgeJob(jobId, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(async () => {
+            taPendingJobs.delete(jobId);
+            // SSE 兜底：超时后一次性查 /jobs（不轮询）
+            try {
+                const r = await fetch(BRIDGE + '/jobs');
+                const d = await r.json();
+                const j = (d.jobs || []).find(x => x.id === jobId);
+                if (j && j.result && j.result.ok && j.result.url) resolve({ url: j.result.url, model: j.result.model || '' });
+                else reject(new Error('超时/未完成：' + (j?.result?.error || '无结果')));
+            } catch (e) { reject(new Error('任务超时（桥无响应）')); }
+        }, timeoutMs);
+        taPendingJobs.set(jobId, { resolve: (v) => { clearTimeout(timer); taPendingJobs.delete(jobId); resolve(v); }, reject: (e) => { clearTimeout(timer); taPendingJobs.delete(jobId); reject(e); }, timer });
+    });
+}
+
+// 桥模式触发（202）：双保险串行——桥 engineer → 失败回退前端 stEngineer → 带 prompt 重提
+async function generateViaBridge(text, name, lock) {
+    const mkBody = (extra) => ({ text: text, name: name, ...extra });
+    const r0 = await fetch(BRIDGE + '/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(mkBody({})) });
+    const d0 = await r0.json();
+    if (!d0.ok) throw new Error(d0.error || '桥触发失败');
+    try {
+        const img = await waitBridgeJob(d0.job, 240000);
+        showImage(img, lock);
+        return;
+    } catch (e) {
+        // 双保险：桥失败（提示词/生成任一步）→ 前端 stEngineer → 带 prompt 重新提交（串行）
+        console.warn('[ta-img][diag] 桥链路失败，回退前端提示词：', e.message);
+        try {
+            const fam = getCurrentFamilySafe();
+            const pr = await stEngineer(text, fam);
+            const r1 = await fetch(BRIDGE + '/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(mkBody({ prompt: { positive: pr.positive, male: pr.male } })) });
+            const d1 = await r1.json();
+            if (!d1.ok) throw new Error('回退提交失败：' + d1.error);
+            const img2 = await waitBridgeJob(d1.job, 240000);
+            showImage(img2, lock);
+        } catch (e2) {
+            throw new Error('双保险回退失败：' + (e2?.message || e2));
+        }
+    }
+}
+function getCurrentFamilySafe() {
+    try { return (window.__taCurFamily || ''); } catch (e) { return ''; }
+}
+
 function connect() {
     if (eventSource) eventSource.close();
     eventSource = new EventSource(BRIDGE + '/events');
@@ -1998,6 +2234,11 @@ function connect() {
         let data;
         try { data = JSON.parse(evt.data); } catch (e) { return; }
         if (data && data.type === 'error') {
+            // 带 job id 的失败 → 交给挂起管理器（双保险回退）；无 job → 全局红条（旧行为）
+            if (data.job && taPendingJobs.has(data.job)) {
+                try { taPendingJobs.get(data.job).reject(new Error(data.message || '桥任务失败')); } catch (e) { /* 忽略 */ }
+                return;
+            }
             showError(data);
             return;
         }
@@ -2013,6 +2254,11 @@ function connect() {
             return;
         }
         if (data && (data.type === 'image' || data.url)) {
+            // 带 job id 的完成 → 交给挂起管理器（带楼层锁挂图）；无 job → 旧兼容路径
+            if (data.job && taPendingJobs.has(data.job)) {
+                try { taPendingJobs.get(data.job).resolve(data); } catch (e) { /* 忽略 */ }
+                return;
+            }
             showImage(data);
         }
     };
@@ -2168,29 +2414,19 @@ async function triggerOnce(msg, overrideText, lockIn) {
         showError({ message: '桥未启动，且 ComfyUI 代理不可用。请在控制台按提示装桥（install.bat）或检查 ComfyUI 地址' });
         return;
     }
+    // ── 桥模式：双保险串行（桥 engineer → 失败回退前端 stEngineer → 带 prompt 重提）──
     try {
-        const resp = await fetch(BRIDGE + '/generate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                text: text,
-                name: msg.name || '角色',
-                model: modelSel?.val() || null,
-                auto_model: autoModelSel ? (autoModelSel.val() || null) : null,
-                loras: loraBox ? Array.from(loraBox.find('input[type=checkbox]:checked')).map(c => c.getAttribute('data-file')) : null,
-                size_mult: sizeSel ? parseFloat(sizeSel.val()) : null,
-                steps_mult: stepsSel ? parseFloat(stepsSel.val()) : null,
-            }),
-        });
-        const data = await resp.json();
-        if (data.ok) {
-            toastr.success('文生图已开始（剧情 → 提示词 → 出图）', '自动文生图');
-        } else {
-            toastr.error(data.error || '触发失败', '自动文生图');
-        }
+        await generateViaBridge(text, msg.name || '角色', lock);
     } catch (e) {
-        console.error('[tavern-auto-img] /generate 调用失败:', e);
-        toastr.error('无法连接桥接服务', '自动文生图');
+        if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')))) {
+            removeImgPlaceholder(lock.el);
+            taLogRun({ status: '⏹ 已中断', error: '用户重roll/编辑/急停' }, true);
+            console.info('[tavern-auto-img] 任务已中断（用户重roll/编辑）');
+            return;
+        }
+        console.error('[tavern-auto-img] 桥模式失败:', e);
+        taLogRun({ status: '❌ 失败', secs: 0, error: (e?.message || '未知错误') }, true);
+        showError({ message: (e?.message || '桥模式出图失败') + ' | 两路提示词均已尝试' });
     }
 }
 

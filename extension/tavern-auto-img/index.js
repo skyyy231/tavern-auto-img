@@ -343,19 +343,29 @@ async function generateViaST(text, name, lock) {
 /** 直连 ComfyUI WS：等自己的 prompt 完成（事件驱动；executing/executed/error 按 prompt_id 分流） */
 function waitComfyDirect(comfyUrl, pid, clientId, signal, timeoutMs) {
     return new Promise((resolve, reject) => {
-        let ws = null, done = false, imgMeta = null;
-        // ⭐ 超时兜底：WS 完成信号可能丢（浏览器连接中断/ComfyUI 事件没到）——超时时刻只查一次 /history/{pid}：
-        //   任务实际完成（有输出图）=成功；真没完成才报超时。这不是轮询（只在超时瞬间查一次）。
-        const timer = setTimeout(async () => {
+        let ws = null, done = false, imgMeta = null, lastMsgAt = Date.now(), watchTimer = null;
+        // ⭐ WS 静默探测器：完成信号偶发丢失（任务在 ComfyUI 跑完但 WS 没推）→ WS 静默>25s 就轻查一次 /history：
+        //   （WS 收到过消息即正常，不再查；只在"信号丢了"时补查——单任务无打架）
+        const probeOnce = async () => {
             try {
                 const h = await (await fetch(comfyUrl + '/history/' + pid, { signal: AbortSignal.timeout(15000) })).json();
                 const node = (h && h[pid] && h[pid].outputs) || {};
                 const imgs = Object.values(node).flatMap(o => (o.images || []));
-                if (imgs && imgs.length) { imgMeta = imgMeta || imgs[0]; console.log('[ta-img][st] ⭐ 超时兜底：任务已完成（history 有图）', imgMeta); finish(); return; }
+                if (imgs && imgs.length) { imgMeta = imgMeta || imgs[0]; console.log('[ta-img][st] ⭐ WS静默补查：任务已完成', imgMeta); finish(); return; }
             } catch (e) { /* 忽略 */ }
+        };
+        watchTimer = setInterval(async () => {
+            if (done) { clearInterval(watchTimer); return; }
+            if (Date.now() - lastMsgAt > 25000) { console.log('[ta-img][st] WS 静默>25s，补查 history…'); await probeOnce(); }
+        }, 30000);
+        // ⭐ 超时兜底：WS 完成信号可能丢（浏览器连接中断/ComfyUI 事件没到）——超时时刻只查一次 /history/{pid}：
+        //   任务实际完成（有输出图）=成功；真没完成才报超时。这不是轮询（只在超时瞬间查一次）。
+        const timer = setTimeout(async () => {
+            if (done) return;
+            await probeOnce();
             finish(new Error('生成超时（ComfyUI 无响应）'), true);
         }, timeoutMs);
-        const fin = (err) => { if (done) return; done = true; clearTimeout(timer); try { signal && signal.removeEventListener('abort', onAbort); } catch { /* 忽略 */ } try { ws && ws.close(); } catch { /* 忽略 */ } err ? reject(err) : resolve(imgMeta); };
+        const fin = (err) => { if (done) return; done = true; clearTimeout(timer); if (watchTimer) clearInterval(watchTimer); try { signal && signal.removeEventListener('abort', onAbort); } catch { /* 忽略 */ } try { ws && ws.close(); } catch { /* 忽略 */ } err ? reject(err) : resolve(imgMeta); };
         const onAbort = () => fin(new Error('已中断'));
         if (signal) { if (signal.aborted) { fin(new Error('已中断')); return; } signal.addEventListener('abort', onAbort); }
         function finish(err) { fin(err); }
@@ -364,6 +374,7 @@ function waitComfyDirect(comfyUrl, pid, clientId, signal, timeoutMs) {
             ws = new WebSocket(wsUrl);
             ws.onopen = () => console.log('[ta-img][st] WS 已连接（事件驱动，非轮询）', pid);
             ws.onmessage = (evt) => {
+                lastMsgAt = Date.now();   // ⭐ WS 活着：收到任何消息即刷新静默计时（静默探测器只在真丢信号时出手）
                 let m; try { m = JSON.parse(evt.data); } catch { return; }
                 if (!m || !m.data) return;
                 if (m.type === 'executing' || m.type === 'progress' || m.type === 'executed') {

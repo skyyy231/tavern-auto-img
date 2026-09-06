@@ -2333,6 +2333,8 @@ async function showBridgeHelp() {
 const seenMessages = new Set();  // 已触发过（防重）
 let autoGenTimer = null;
 let taAllowTrigger = false;      // 用户消息门闩：只有用户发过消息后才允许出图（切卡=锁，防历史加载自动出图）
+let taResendArmed = false;       // 重发信号（#option_regenerate 点击后 60s 内=重发窗口）
+let taResendTimer = null;        // 重发窗口超时计时器
 let taChatChangedAt = Date.now(); // 最近一次切卡/加载时间（5 秒窗口内渲染的用户消息=历史加载，不解锁）
 let taLastUserSentDate = '';      // 最近一条用户消息 send_date（回复须晚于它；历史/开场白早于它→拦）
 
@@ -2462,6 +2464,15 @@ function taBindSendMonitor() {
     $sb.on('click', unlock);
     const $ta = $('#send_textarea');
     if ($ta.length) $ta.on('keydown', function (e) { if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey) unlock(); });
+    // ⭐ 信号2：☰ 菜单「重新生成」（#option_regenerate 点击）= 重发信号（用户：两个信号同时监控，哪个干活用哪个）
+    $(document).on('click', '#option_regenerate', function () {
+        taResendArmed = true;
+        taAllowTrigger = true;
+        seenMessages.clear();
+        if (taResendTimer) clearTimeout(taResendTimer);
+        taResendTimer = setTimeout(() => { taResendArmed = false; }, 60000);
+        console.log('[ta-img][diag] 重新生成按钮点击 → 解锁+清seen（重发信号）· 60s 内重发兜底可触发');
+    });
     // 用户点"圆圈"（急停）→ 中断图任务（ST 自己停止生成；我们同步停图）
     if ($ms && $ms.length) {
         $ms.on('click', function () {
@@ -2472,32 +2483,46 @@ function taBindSendMonitor() {
     }
     // 完成检测：生成中 #mes_stop（圆圈）display:flex；完成后 display:none（圆消失=回到纸飞机态）→ 唯一出图触发点
     const isStopVisible = function () { return $ms.length && $ms.css('display') !== 'none'; };
+    const taFireTrigger = function (src) {
+        try {
+            const c = getCtx();
+            // 直接从网页抓最新角色回复文本（DOM=用户所见；不赌 chat 数组时序）
+            const $mes = $('.mes[is_user="false"]').last();
+            const domText = $mes.length ? ($mes.find('.mes_text').text() || '').trim() : '';
+            const domName = $mes.length ? ($mes.attr('ch_name') || '') : '';
+            console.log('[ta-img][diag] ' + (src || '触发') + '：', (domName || '?'), '| 网页文本头=', String(domText).slice(0, 60).replace(/\n/g, ' '), '| domLen=', domText.length);
+            const last = c && c.chat ? c.chat[c.chat.length - 1] : null;
+            // 楼层锚：抓住这一层 .mes 元素本身（出图后原地放图，与楼层绑定定死）
+            const elLock = $mes.length ? $mes[0] : null;
+            console.log('[ta-img][diag] 楼层锚=', elLock ? ('#mes 元素已捕获 isConnected=' + elLock.isConnected) : 'null');
+            if (last && !last.is_user && !last.is_system) triggerOnce(last, domText, { el: elLock });
+            else if (domText && domName) triggerOnce({ name: domName, mes: domText, is_user: false }, domText, { el: elLock });
+        } catch (e) { /* 忽略 */ }
+    };
     const mo = new MutationObserver(function () {
         const nowV = isStopVisible();
         if (prevStopVisible && !nowV) {
             console.log('[ta-img][diag] 圆圈消失（生成完成）→ 300ms 后抓网页文本出图');
             try {
                 if (autoGenTimer) clearTimeout(autoGenTimer);
-                autoGenTimer = setTimeout(function () {
-                    try {
-                        const c = getCtx();
-                        // 直接从网页抓最新角色回复文本（DOM=用户所见；不赌 chat 数组时序）
-                        const $mes = $('.mes[is_user="false"]').last();
-                        const domText = $mes.length ? ($mes.find('.mes_text').text() || '').trim() : '';
-                        const domName = $mes.length ? ($mes.attr('ch_name') || '') : '';
-                        console.log('[ta-img][diag] 触发目标：', (domName || '?'), '| 网页文本头=', String(domText).slice(0, 60).replace(/\n/g, ' '), '| domLen=', domText.length);
-                        const last = c && c.chat ? c.chat[c.chat.length - 1] : null;
-                        // 楼层锚：抓住这一层 .mes 元素本身（出图后原地放图，与楼层绑定定死）
-                        const elLock = $mes.length ? $mes[0] : null;
-                        console.log('[ta-img][diag] 楼层锚=', elLock ? ('#mes 元素已捕获 isConnected=' + elLock.isConnected) : 'null');
-                        if (last && !last.is_user && !last.is_system) triggerOnce(last, domText, { el: elLock });
-                        else if (domText && domName) triggerOnce({ name: domName, mes: domText, is_user: false }, domText, { el: elLock });
-                    } catch (e) { /* 忽略 */ }
-                }, 300);
+                autoGenTimer = setTimeout(function () { taFireTrigger('圆圈消失'); }, 300);
             } catch (e) { /* 忽略 */ }
         }
         prevStopVisible = nowV;
     });
+    // ⭐ 重发兜底：重发信号后 60s 内，若重发完成（生成结束 message_updated）而圆圈信号缺席 → 兜底触发（哪个信号干活用哪个）
+    if (!window.__taResendFallbackBound) {
+        window.__taResendFallbackBound = true;
+        const ctx0 = getCtx();
+        if (ctx0 && ctx0.eventSource) {
+            ctx0.eventSource.on('message_updated', function () {
+                if (!taResendArmed || !taAllowTrigger) return;
+                taResendArmed = false;
+                console.log('[ta-img][diag] 重发兜底：message_updated（生成结束）→ 触发重发出图');
+                setTimeout(function () { taFireTrigger('重发兜底'); }, 300);
+            });
+        }
+    }
     let prevStopVisible = isStopVisible();
     if ($ms && $ms.length) mo.observe($ms[0], { attributes: true, attributeFilter: ['style', 'class'] });
     window.__taSendBound = true;

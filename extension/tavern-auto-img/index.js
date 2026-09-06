@@ -161,19 +161,42 @@ async function stEngineer(text, family) {
     };
     // 面板里填过自定义 key → 用酒馆密钥库独立槽（secret_id），与酒馆自身 API 互不干扰
     try { const sid = (llmCfg.secretId || '').trim(); if (sid) body.secret_id = sid; } catch (e) { /* 忽略 */ }
-    const r = await fetch('/api/backends/chat-completions/generate', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify(body),
-        signal: stAbort ? stAbort.signal : undefined,
-    });
-    const j = await r.json();
-    if (!r.ok) {
-        console.log('[ta-img][diag] 提示词 LLM 失败：status=', r.status, '| 响应=', JSON.stringify(j).slice(0, 300));
-        taLogRun({ llm: '❌ HTTP ' + r.status + '：' + String(j?.error?.message || '').slice(0, 80) });
-        throw new Error(String(j?.error?.message || 'LLM 调用失败 ' + r.status));
+    // ⭐ 自动重试：LLM API 偶发不通（498/499/500/超时/空内容）→ 重试最多 3 次，并非每次都要用户看到红 toast
+    let j = null, r = null, lastErr = '';
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        if (attempt > 1) {
+            const waitMs = attempt === 2 ? 2500 : 3500;
+            console.log('[ta-img][diag] 提示词 LLM 第' + attempt + '次重试（' + waitMs + 'ms 后）…');
+            await new Promise(resv => setTimeout(resv, waitMs));
+        }
+        try {
+            r = await fetch('/api/backends/chat-completions/generate', {
+                method: 'POST',
+                headers: getRequestHeaders(),
+                body: JSON.stringify(body),
+                signal: stAbort ? stAbort.signal : undefined,
+            });
+            j = await r.json();
+            lastErr = String(j?.error?.message || 'LLM 调用失败 ' + r.status);
+            if (r.ok && (j?.choices?.[0]?.message?.content || '').trim().length > 0) break;
+            console.log('[ta-img][diag] 提示词 LLM 第' + attempt + '次未达标：status=' + r.status + ' content=' + String(j?.choices?.[0]?.message?.content || '').length);
+            if (attempt === 3) { /* 最后一次：走出循环走报错 */ }
+        } catch (e) {
+            lastErr = String(e.message || e);
+            console.log('[ta-img][diag] 提示词 LLM 第' + attempt + '次异常：' + lastErr);
+        }
+    }
+    if (!r || !r.ok) {
+        console.log('[ta-img][diag] 提示词 LLM 失败（重试后）：status=', r ? r.status : '(网络异常)', '| 响应=', JSON.stringify(j || {}).slice(0, 300));
+        taLogRun({ llm: '❌ HTTP ' + (r ? r.status : '网络') + '：' + String(lastErr).slice(0, 80) });
+        throw new Error(String(lastErr));
     }
     const content = j?.choices?.[0]?.message?.content || '';
+    if (!content.trim()) {
+        console.log('[ta-img][diag] 提示词 LLM 重试 3 次后内容仍为空'); 
+        taLogRun({ llm: '❌ 重试 3 次后内容为空' });
+        throw new Error('LLM 返回空内容（已重试 3 次）');
+    }
     console.log('[ta-img][diag] 提示词返回：content长度=', content.length, '| 前80字=', content.slice(0, 80).replace(/\n/g, ' '));
     taLogRun({ llm: '✅ ' + llmModel + ' content=' + content.length + '字' });
     try {

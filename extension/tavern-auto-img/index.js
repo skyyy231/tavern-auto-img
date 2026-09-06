@@ -84,9 +84,9 @@ const ST_RECIPES = {
     anima: { clip: ['miaomiaoHarem_anima16_txt.safetensors', 'qwen_image'], vae: 'qwen_image-vae.safetensors', latent: ['EmptySD3LatentImage', 16], sampler: 'euler', scheduler: 'simple', steps: 20, cfg: 4.0, width: 512, height: 768 },
     krea2: { clip: ['gonzalomoKrea2_v40_txt.safetensors', 'krea2'], vae: 'qwen_image-vae.safetensors', latent: ['EmptySD3LatentImage', 16], sampler: 'er_sde', scheduler: 'simple', steps: 8, cfg: 1.0, width: 832, height: 1216 },
     flux: { clip: ['t5xxl_fp8_e4m3fn.safetensors', 'flux'], vae: 'flux-vae-bf16.safetensors', latent: ['EmptySD3LatentImage', 16], sampler: 'euler', scheduler: 'simple', steps: 20, cfg: 1.0, width: 832, height: 1216, dual: true, clip2: 'clip_l.safetensors' },
-    sdxl: { checkpoint: true, latent: ['EmptyLatentImage', 4], sampler: 'euler', scheduler: 'normal', steps: 20, cfg: 7.0, width: 512, height: 768 },
+    sdxl: { checkpoint: true, latent: ['EmptyLatentImage', 4], sampler: 'euler', scheduler: 'normal', steps: 28, cfg: 7.0, width: 832, height: 1216 },
 };
-function stBuildWorkflow(modelFile, family, loras, sizeMult, stepsMult, positive, negative) {
+function stBuildWorkflow(modelFile, family, loras, wNum, hNum, stepsNum, positive, negative) {
     const rec = ST_RECIPES[family] || ST_RECIPES['anima'];
     let nid = 0;
     const wf = {};
@@ -112,9 +112,9 @@ function stBuildWorkflow(modelFile, family, loras, sizeMult, stepsMult, positive
         wf[vn] = { class_type: 'VAELoader', inputs: { vae_name: rec.vae } };
         vaeRef = [vn, 0];
     }
-    const w = Math.round(rec.width * sizeMult / 8) * 8;
-    const h = Math.round(rec.height * sizeMult / 8) * 8;
-    const steps = Math.max(1, Math.round(rec.steps * stepsMult));
+    const w = Math.max(64, Math.round((wNum || rec.width) / 8) * 8);
+    const h = Math.max(64, Math.round((hNum || rec.height) / 8) * 8);
+    const steps = Math.max(1, parseInt(stepsNum || rec.steps, 10) || rec.steps);
     const ln = nxt();
     wf[ln] = { class_type: rec.latent[0], inputs: rec.latent[0] === 'EmptySD3LatentImage' ? { width: w, height: h, batch_size: 1, channels: rec.latent[1] } : { width: w, height: h, batch_size: 1 } };
     const pn = nxt(); clipText(pn, clipRef, positive);
@@ -257,8 +257,12 @@ async function generateViaST(text, name, lock) {
     let loras = loraBox ? Array.from(loraBox.find('input[type=checkbox]:checked')).map(c => c.getAttribute('data-file') || '') : [];
     if (!loras.length && Array.isArray(localCfg.loras)) loras = localCfg.loras;
     const fNum = (s, d) => { const n = parseFloat(s); return isFinite(n) ? n : d; };
-    const sizeMult = fNum(sizeSel?.val(), fNum(String(localCfg.size_mult ?? ''), 1));
-    const stepsMult = fNum(stepsSel?.val(), fNum(String(localCfg.steps_mult ?? ''), 1));
+    // 速度档位（2026-09-06 v3）：直接输入步数/宽高；留空=用该模型家族推荐值（推荐随模型变化）
+    const recNow = ST_RECIPES[family] || ST_RECIPES['anima'];
+    const stepsN = parseInt((document.getElementById('tavern-img-steps')?.value || ''), 10) || (localCfg.steps_num != null ? localCfg.steps_num : recNow.steps);
+    const wN = parseInt((document.getElementById('tavern-img-width')?.value || ''), 10) || (localCfg.w_num != null ? localCfg.w_num : recNow.width);
+    const hN = parseInt((document.getElementById('tavern-img-height')?.value || ''), 10) || (localCfg.h_num != null ? localCfg.h_num : recNow.height);
+    taLogRun({ steps: stepsN, size: wN + 'x' + hN });
     let comfyUrl = (document.getElementById('tavern-img-comfy')?.value || '').trim() || (localCfg.comfy_url || '').trim() || 'http://127.0.0.1:8188';
     comfyUrl = comfyUrl.replace(/\/+$/, '');
 
@@ -278,7 +282,7 @@ async function generateViaST(text, name, lock) {
     const lorasArr = loras.map(f => [f, 0.8, 0.8]);
     const wf = useCustomWf
         ? applyWfCustom(wfCfg.wf, pr.positive, negative)
-        : stBuildWorkflow(modelFile, family, lorasArr, sizeMult, stepsMult, pr.positive, negative);
+        : stBuildWorkflow(modelFile, family, lorasArr, wN, hN, stepsN, pr.positive, negative);
 
     // ── 直连 ComfyUI：POST /prompt → WS 事件等完成 → /history 取图（零轮询）──
     stAbort = new AbortController();
@@ -849,14 +853,16 @@ function buildPanelUI($host) {
         }
     });
 
-    // ③ 速度档位（尺寸倍率 + 步数倍率，自由组合）
+    // ③ 速度档位（v3：直接输入步数/分辨率；留空=自动用该模型推荐，推荐随所选模型自动变化）
     const $rowSpeed = mkRow('fa-bolt', '速度档位：');
-    const $sizeSel = $('<select id="tavern-img-sizemult" style="margin-right:10px;font-size:16px;"></select>');
-    const $stepsSel = $('<select id="tavern-img-stepsmult" style="font-size:16px;"></select>');
-    const $sizeLab = $('<span class="muted" style="margin-right:6px;">步子×</span>');
-    const $stepsLab = $('<span class="muted" style="margin-right:6px;">尺寸×</span>');
-    // 顺序：先标尺寸
-    $rowSpeed.append($sizeLab, $sizeSel, $stepsLab, $stepsSel);
+    const $stepsNum = $('<input id="tavern-img-steps" type="number" min="0" max="120" step="1" placeholder="自动" style="width:66px;font-size:16px;text-align:center;" title="生成步数：留空=自动用推荐值。越少越快、越多越细">');
+    const $wNum = $('<input id="tavern-img-width" type="number" min="32" max="2048" step="8" placeholder="自动" style="width:82px;font-size:16px;text-align:center;" title="画面宽：留空=自动用推荐值">');
+    const $hNum = $('<input id="tavern-img-height" type="number" min="32" max="2048" step="8" placeholder="自动" style="width:82px;font-size:16px;text-align:center;" title="画面高：留空=自动用推荐值">');
+    const $stepsLab = $('<span class="muted" style="margin-right:6px;">步数</span>');
+    const $sizeLab = $('<span class="muted" style="margin-right:6px;">分辨率</span>');
+    const $recHint = $('<span class="muted" name="ta-img-rec-hint" style="margin-left:8px;font-size:14px;color:#93c5fd;white-space:nowrap;" title="推荐值来自当前所选模型对应的家族（kodoranime=SDXL…），选模型后自动更新。直接输入会用你的值。"></span>');
+    // 顺序：步数 → 宽×高 → 推荐
+    $rowSpeed.append($stepsLab, $stepsNum, $sizeLab, $wNum, $('<span class="muted">×</span>'), $hNum, $recHint);
     $panel.append($rowSpeed);
 
     // ④ 模型目录自选（extra_model_paths 管理）
@@ -1349,10 +1355,18 @@ function buildPanelUI($host) {
     $rowBtn.append($btn, $swState);
     $stopRow.prepend($rowBtn);   // 开关在前，停止任务后移
 
-    const SIZE_OPTS = [[1.25, '1.25× 精细'], [1, '1× 标准'], [0.75, '0.75× 快速']];
-    const STEPS_OPTS = [[1.5, '1.5× 精细'], [1, '1× 标准'], [0.75, '0.75×'], [0.5, '0.5× 草稿']];
-    SIZE_OPTS.forEach(([v, lab]) => $sizeSel.append(`<option value="${v}">${lab}</option>`));
-    STEPS_OPTS.forEach(([v, lab]) => $stepsSel.append(`<option value="${v}">${lab}</option>`));
+    // 推荐文案函数：按当前模型（家族）刷新"推荐 步数×分辨率"
+    function updateRecHint() {
+        const f = (modelSel?.val() || autoModelSel?.val() || '') || '';
+        const fam = f ? stDetectFamily(f) : 'anima';
+        const rec = ST_RECIPES[fam] || ST_RECIPES['anima'];
+        const $h = $('[name="ta-img-rec-hint"]');
+        if ($h.length) {
+            const modelTxt = f ? (f.split(/[\\\\/]/).pop().slice(0, 26)) : '未选模型';
+            $h.text(`推荐 ${rec.steps} 步 · ${rec.width}×${rec.height}（${modelTxt}）`);
+        }
+        return fam;
+    }
 
     let currentKey = '';
     let currentAutoModels = [];  // 动态模型清单（桥 /model 返回的 auto_models）
@@ -1469,17 +1483,19 @@ function buildPanelUI($host) {
         $loraBox.find('input[type=checkbox]').each(function () {
             if (this.checked) loras.push(this.getAttribute('data-file'));
         });
-        const sizeMultV = parseFloat($sizeSel.val());
-        const stepsMultV = parseFloat($stepsSel.val());
+        const stepsV = parseInt(document.getElementById('tavern-img-steps')?.value || '', 10);
+        const wV = parseInt(document.getElementById('tavern-img-width')?.value || '', 10);
+        const hV = parseInt(document.getElementById('tavern-img-height')?.value || '', 10);
         const body = {
             key: $select.val(),
             loras: loras,
-            size_mult: sizeMultV,
-            steps_mult: stepsMultV,
+            steps_num: Number.isFinite(stepsV) ? stepsV : null,
+            w_num: Number.isFinite(wV) ? wV : null,
+            h_num: Number.isFinite(hV) ? hV : null,
         };
         if (!connected) {
             // 无桥模式：速度档位存本地（模型/LoRA 由各自面板项保存）
-            taSetLocalCfg({ size_mult: Number.isFinite(sizeMultV) ? sizeMultV : 1, steps_mult: Number.isFinite(stepsMultV) ? stepsMultV : 1 });
+            taSetLocalCfg({ steps_num: body.steps_num, w_num: body.w_num, h_num: body.h_num });
             toastr.success('速度档位已保存（无桥模式·本地）', '自动文生图');
             return;
         }
@@ -1515,8 +1531,8 @@ function buildPanelUI($host) {
             }
             currentKey = data.key;
             $select.val(currentKey);
-            $sizeSel.val(String(data.size_mult ?? 1));
-            $stepsSel.val(String(data.steps_mult ?? 1));
+            // 桥模式速度档位回填：无新字段（steps_num/w_num/h_num）时留空=自动推荐
+
             currentOptions = data.options;  // 快照，供刷新 LoRA/换模型重渲染
             renderLoras(data.options, currentKey, data.loras);
             // 动态模型（自动发现）：桥返回 auto_models=[{file,family,label}] 才渲染该行，否则隐藏（防御）
@@ -1570,8 +1586,9 @@ function buildPanelUI($host) {
                     // 回填速度档位（无桥·本地保存值，免得每次刷新重选）
                     try {
                         const lc = JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}');
-                        if (lc.size_mult != null) $sizeSel.val(String(lc.size_mult));
-                        if (lc.steps_mult != null) $stepsSel.val(String(lc.steps_mult));
+                        if (lc.steps_num != null) $('#tavern-img-steps').val(lc.steps_num);
+                        if (lc.w_num != null) $('#tavern-img-width').val(lc.w_num);
+                        if (lc.h_num != null) $('#tavern-img-height').val(lc.h_num);
                     } catch (e) { /* 忽略 */ }
                     $select.empty().append('<option value="">无桥模式（模型在右侧动态列表）</option>');
                 } else {
@@ -1598,7 +1615,7 @@ function buildPanelUI($host) {
                                 $autoHint.text(rec ? `家族：${rec.family || '-'}` : '');
                                 localStorage.setItem('taImgLocalCfg', JSON.stringify({ ...(JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}')), auto_model: cur }));
                             }
-                            try { const lc = JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}'); if (lc.size_mult != null) $sizeSel.val(String(lc.size_mult)); if (lc.steps_mult != null) $stepsSel.val(String(lc.steps_mult)); } catch (e) { /* 忽略 */ }
+                            try { const lc = JSON.parse(localStorage.getItem('taImgLocalCfg') || '{}'); if (lc.steps_num != null) $('#tavern-img-steps').val(lc.steps_num); if (lc.w_num != null) $('#tavern-img-width').val(lc.w_num); if (lc.h_num != null) $('#tavern-img-height').val(lc.h_num); } catch (e) { /* 忽略 */ }
                             $select.empty().append('<option value="">无桥模式（模型在右侧动态列表）</option>');
                         } else { $select.empty().append('<option value="">桥接服务未连接</option>'); }
                     } catch (e2) { $select.empty().append('<option value="">桥接服务未连接</option>'); }
@@ -1965,6 +1982,7 @@ function buildPanelUI($host) {
         renderLoras(currentOptions, currentKey, readCheckedLoras());
         // 手动选择也记本地（无桥 generateViaST 兜底；桥模式同存无副作用）
         taSetLocalCfg({ auto_model: file });
+        updateRecHint();   // ⭐ 无桥换模型 → 刷新推荐（步数/分辨率随家族变化）
         if (!connected) {
             toastr.success(file ? `模型已设为 ${rec?.label || file}（无桥·本地）` : '已清除模型（无桥·本地）', '自动文生图');
             return;
@@ -1980,7 +1998,7 @@ function buildPanelUI($host) {
 
     $select.on('change', function () {
         const key = $(this).val();
-        if (!key || key === currentKey) { saveSettings(); return; }
+        if (!key || key === currentKey) { saveSettings(); updateRecHint(); return; }
         currentKey = key;
         // 换模型 → 默认勾选该模型 default_loras，再保存
         fetch(BRIDGE + '/model').then(r => r.json()).then(data => {
@@ -1989,14 +2007,15 @@ function buildPanelUI($host) {
             renderLoras(data.options, key, defaults);
             saveSettings();
         }).catch(() => {});
+        updateRecHint();   // ⭐ 换模型 → 刷新推荐（步数/分辨率随家族变化）
     });
 
             $loraBox.on('change', 'input[type=checkbox]', function () { saveSettings(); updateLoraBadge(); });
-    $sizeSel.on('change', saveSettings);
-    $stepsSel.on('change', saveSettings);
+    $('#tavern-img-steps, #tavern-img-width, #tavern-img-height').on('change', saveSettings);
 
     // 提升为模块级引用（v3 事件触发用）
     modelSel = $select; loraBox = $loraBox; sizeSel = $sizeSel; stepsSel = $stepsSel; autoModelSel = $autoSel;
+    setTimeout(updateRecHint, 500);   // ⭐ 初始化推荐文案（等模型列表回填后刷新）
 
     // ── 通道状态切换（无桥模式灰化依赖桥的能力 + 中文说明；桥模式恢复原样）──
     applyChannelUI = function (ch) {

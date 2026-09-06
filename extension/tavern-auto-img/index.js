@@ -436,14 +436,16 @@ function taRerunPrompt() {
             const el = job.lock && job.lock.el;
             if (el && el.isConnected) $(el).find('.ta-img-ph-wrap, .ta-img-done-wrap, .ta-img-fail-wrap, .ta-img-real, .ta-img-ph, .ta-img-fail, .ta-img-rerun').remove();
             else removeImgPlaceholder();
-            // ② 重新抓取本楼层消息文本（楼层仍在→抓最新 DOM 文本；否则用旧记录）
+            // ② 提示词抓取（换方式）：直接用触发时记录的原文（记录版=当时从 DOM 抓到并校验过的文本）；
+            //    DOM 重新抓只作为兜底（消息被编辑后想用新文本——但重生成=重出同一层，原文优先且绝不抓空）
             let text = job.text || '';
             try {
-                if (el && el.isConnected) {
+                if (!text && el && el.isConnected) {
                     const t = ($(el).find('.mes_text').last().text() || '').trim();
                     if (t) text = t;
                 }
             } catch (e) { /* 忽略 */ }
+            console.log('[ta-img][diag] 重生成·提示词来源=', text ? ('记录原文 ' + text.length + '字（头30=' + text.slice(0, 30) + '）') : '空', '| 楼层DOM=', (el && el.isConnected) ? '在' : '不在');
             // ③ 过程态占位符（生成中不显示按钮）
             addImgPlaceholder(job.lock.el, job.name);
             // ④ 正常生成流程

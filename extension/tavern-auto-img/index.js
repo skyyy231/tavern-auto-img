@@ -270,13 +270,18 @@ async function generateViaST(text, name, lock) {
     const pid = sub.prompt_id;
     if (!pid) throw new Error('ComfyUI 未返回 prompt_id');
     await waitComfyDirect(comfyUrl, pid, clientId, stAbort.signal, 240000);   // 事件驱动（WS），非轮询
-    // 完成后一次性 /history 取图
-    const hist = await (await fetch(comfyUrl + '/history/' + pid, { signal: stAbort.signal })).json();
-    const node = (hist[pid] || {});
-    let imgMeta = null;
-    for (const [_nid, nout] of Object.entries(node.outputs || {})) {
-        const imgs = nout.images || [];
-        if (imgs && imgs.length) { imgMeta = imgs[0]; break; }
+    // 完成后一次性 /history 取图（WS 消息可能早于落盘 → 小重试 3 次，命中即停）
+    let hist = {}, imgMeta = null;
+    for (let attempt = 0; attempt < 3 && !imgMeta; attempt++) {
+        try {
+            hist = await (await fetch(comfyUrl + '/history/' + pid, { signal: stAbort.signal })).json();
+            const node = (hist[pid] || {});
+            for (const [_nid, nout] of Object.entries(node.outputs || {})) {
+                const imgs = nout.images || [];
+                if (imgs && imgs.length) { imgMeta = imgs[0]; break; }
+            }
+        } catch (e) { /* 忽略，继续 */ }
+        if (!imgMeta && attempt < 2) await new Promise(r => setTimeout(r, 600));
     }
     if (!imgMeta) throw new Error('完成但未找到输出图');
     const vUrl = comfyUrl + '/view?' + new URLSearchParams({ filename: imgMeta.filename, subfolder: imgMeta.subfolder || '', type: imgMeta.type || 'output' });

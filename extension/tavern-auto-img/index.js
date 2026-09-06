@@ -343,9 +343,19 @@ async function generateViaST(text, name, lock) {
 /** 直连 ComfyUI WS：等自己的 prompt 完成（事件驱动；executing/executed/error 按 prompt_id 分流） */
 function waitComfyDirect(comfyUrl, pid, clientId, signal, timeoutMs) {
     return new Promise((resolve, reject) => {
-        let ws = null, done = false;
-        const timer = setTimeout(() => finish(new Error('生成超时（WS 无完成信号）'), true), timeoutMs);
-        const fin = (err) => { if (done) return; done = true; clearTimeout(timer); try { signal && signal.removeEventListener('abort', onAbort); } catch { /* 忽略 */ } try { ws && ws.close(); } catch { /* 忽略 */ } err ? reject(err) : resolve(); };
+        let ws = null, done = false, imgMeta = null;
+        // ⭐ 超时兜底：WS 完成信号可能丢（浏览器连接中断/ComfyUI 事件没到）——超时时刻只查一次 /history/{pid}：
+        //   任务实际完成（有输出图）=成功；真没完成才报超时。这不是轮询（只在超时瞬间查一次）。
+        const timer = setTimeout(async () => {
+            try {
+                const h = await (await fetch(comfyUrl + '/history/' + pid, { signal: AbortSignal.timeout(15000) })).json();
+                const node = (h && h[pid] && h[pid].outputs) || {};
+                const imgs = Object.values(node).flatMap(o => (o.images || []));
+                if (imgs && imgs.length) { imgMeta = imgMeta || imgs[0]; console.log('[ta-img][st] ⭐ 超时兜底：任务已完成（history 有图）', imgMeta); finish(); return; }
+            } catch (e) { /* 忽略 */ }
+            finish(new Error('生成超时（ComfyUI 无响应）'), true);
+        }, timeoutMs);
+        const fin = (err) => { if (done) return; done = true; clearTimeout(timer); try { signal && signal.removeEventListener('abort', onAbort); } catch { /* 忽略 */ } try { ws && ws.close(); } catch { /* 忽略 */ } err ? reject(err) : resolve(imgMeta); };
         const onAbort = () => fin(new Error('已中断'));
         if (signal) { if (signal.aborted) { fin(new Error('已中断')); return; } signal.addEventListener('abort', onAbort); }
         function finish(err) { fin(err); }

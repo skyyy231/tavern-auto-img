@@ -2469,10 +2469,28 @@ function taBindSendMonitor() {
         taResendArmed = true;
         taAllowTrigger = true;
         seenMessages.clear();
+        taInterruptImageTask();      // ⭐ 重发=删本条+再生：旧任务必须先断（ST 不发 message_swiped，只能这里补）
+        removeImgPlaceholder();      // ⭐ 旧占位符一并清除
         if (taResendTimer) clearTimeout(taResendTimer);
         taResendTimer = setTimeout(() => { taResendArmed = false; }, 60000);
-        console.log('[ta-img][diag] 重新生成按钮点击 → 解锁+清seen（重发信号）· 60s 内重发兜底可触发');
+        console.log('[ta-img][diag] 重新生成按钮点击 → 中断旧任务+删占位+解锁+清seen（重发信号）· 60s 内重发兜底可触发');
     });
+    // ⭐ 信号2b：用户消息右侧「重新发送」↻（类名不固定→泛化委托：用户消息按钮里图标含 fa-rotate/fa-sync/fa-arrows-rotate 的点击）
+    if (!window.__taUserResendBound) {
+        window.__taUserResendBound = true;
+        $(document).on('click', '.mes[is_user="true"] .mes_button', function () {
+            const cls = (this.className || '') + ' ' + (this.title || '');
+            if (!/rotat|sync|reply|send|again|resend|redo/i.test(cls)) return;
+            taResendArmed = true;
+            taAllowTrigger = true;
+            seenMessages.clear();
+            taInterruptImageTask();
+            removeImgPlaceholder();
+            if (taResendTimer) clearTimeout(taResendTimer);
+            taResendTimer = setTimeout(() => { taResendArmed = false; }, 60000);
+            console.log('[ta-img][diag] 用户消息重发↻点击 → 中断旧任务+删占位+解锁+清seen（重发信号）· 60s 兜底');
+        });
+    }
     // 用户点"圆圈"（急停）→ 中断图任务（ST 自己停止生成；我们同步停图）
     if ($ms && $ms.length) {
         $ms.on('click', function () {

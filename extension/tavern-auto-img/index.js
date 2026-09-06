@@ -244,6 +244,7 @@ async function stPreflight(family, comfyUrl) {
 
 /** 无桥模式：全链出图（工程器 → 工作流 → ST 代理 → 存文件 → 嵌入聊天） */
 async function generateViaST(text, name, lock) {
+    stAbort = new AbortController();   // ⭐ 必须最先建：stEngineer 的 fetch 要用"本任务全新信号"（否则沿用已 abort 的旧信号→ signal is aborted）
     const myEpoch = ++taGenEpoch;   // ⭐ 任务纪元号：本任务领取号码；被中断/被接管时旧任务自杀
     console.log('[ta-img][st] ① 进入无桥出图', { textLen: (text || '').length, name, epoch: myEpoch });
     const localCfg = taGetLocalCfg();
@@ -289,7 +290,6 @@ async function generateViaST(text, name, lock) {
         : stBuildWorkflow(modelFile, family, lorasArr, wN, hN, stepsN, pr.positive, negative);
 
     // ── 直连 ComfyUI：POST /prompt → WS 事件等完成 → /history 取图（零轮询）──
-    stAbort = new AbortController();
     const clientId = Math.random().toString(36).slice(2) + Date.now().toString(36);
     if (taGenEpoch !== myEpoch) { const e = new Error('任务已被接管'); e.name = 'AbortError'; throw e; }   // ⭐ 纪元自查
     const r = await fetch(comfyUrl + '/prompt', {

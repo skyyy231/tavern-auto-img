@@ -146,7 +146,9 @@ async function stEngineer(text, family, myKill) {
     const llmModel = (document.getElementById('tavern-img-llm-model')?.value || '').trim() || llmCfg.model || 'openclaw/tavern';
     // 提示词规则：无桥本地 prompt_edit 非空时覆盖默认工程器模板（{family} 占位符保留）
     let stSys = TA_ENGINEER_SYSTEM;
-    try { const pe = (taGetLocalCfg().prompt_edit || '').trim(); if (pe) stSys = pe; } catch (e) { /* 忽略 */ }
+    let peUsed = '';
+    try { const pe = (taGetLocalCfg().prompt_edit || '').trim(); if (pe) { stSys = pe; peUsed = pe.slice(0, 60); } } catch (e) { /* 忽略 */ }
+    console.log('[ta-img][diag] stEngineer 诊断 | endpoint=', llmEndpoint, '| model=', llmModel, '| secretId=', String(llmCfg.secretId || '').slice(0, 8) + '…', '| system=', peUsed ? ('自定义prompt_edit覆盖,头60=' + peUsed) : ('默认模板 ' + stSys.length + '字'));
     const body = {
         messages: [
             { role: 'system', content: stSys.replace('{family}', family) },

@@ -422,9 +422,16 @@ function addImgPlaceholder(el, msgName) {
     }
     console.log('[ta-img][diag] 占位符已插入（楼层=', (el && el.isConnected ? '锚定' : '找回'), '）');
 }
-// ⭐ 结果态旁「🔄 重新生成」按钮：覆盖该楼层（未生成/已生成图）→ 重新抓取本楼层消息 → 正常生成流程
-function taRerunPrompt() {
-    const job = taLastJob;
+// ⭐ 结果态旁「🔄 重新生成」按钮：覆盖该楼层（未生成/已生成图）→ 按楼层取该层消息 → 正常生成流程
+function taRerunPrompt(evt) {
+    // ⭐ 按点击按钮所在的楼层（.mes）取本层任务：并发多张时点哪层重跑哪层，绝不被全局 taLastJob(最新消息)带偏
+    let job = null;
+    try {
+        const $mes = evt && evt.target ? $(evt.target).closest('.mes') : null;
+        const mesId = $mes && $mes.length ? ($mes.attr('mesid') || '') : '';
+        if (mesId && taJobs.has(mesId)) job = taJobs.get(mesId);
+    } catch (e) { /* 忽略 */ }
+    if (!job) job = taLastJob;
     if (!job) { toastr.warning('还没有可重跑的出图任务（先发一条消息触发一次）', '自动文生图'); return; }
     if (window.__taRerunBusy) return;
     window.__taRerunBusy = true;
@@ -469,7 +476,7 @@ function taRerunPrompt() {
 }
 if (!window.__taRerunBound) {
     window.__taRerunBound = true;
-    $(document).on('click', '.ta-img-rerun', function () { taRerunPrompt(); });
+    $(document).on('click', '.ta-img-rerun', function (e) { e.preventDefault(); taRerunPrompt.call(this, e); });
 }
 function replaceImgPlaceholder(url, el) {
     // 占位符=图槽：原地把占位符换成成品图（绑定该楼层，不删重插、位置不变）；按钮随结果态出现
@@ -2466,6 +2473,7 @@ let taAllowTrigger = false;      // 用户消息门闩：只有用户发过消�
 let taResendArmed = false;       // 重发信号（#option_regenerate 点击后 60s 内=重发窗口）
 let taResendTimer = null;        // 重发窗口超时计时器
 let taLastJob = null;            // 最近一次出图任务（文本/角色名/楼层锁）——占位符「重新生成提示词」按钮用
+const taJobs = new Map();        // ⭐ mesId → job：每层各存各的任务（并发场景点哪层的🔄就重跑哪层，绝不串楼层）
 let taGenEpoch = 0;              // 任务纪元号：每次新任务/中断 +1；旧任务每步自查（过期=抛 AbortError 自杀）→ 手动重跑/自动重试/重发互不打架
 let taChatChangedAt = Date.now(); // 最近一次切卡/加载时间（5 秒窗口内渲染的用户消息=历史加载，不解锁）
 let taLastUserSentDate = '';      // 最近一条用户消息 send_date（回复须晚于它；历史/开场白早于它→拦）
@@ -2522,7 +2530,9 @@ async function triggerOnce(msg, overrideText, lockIn) {
     // 任务锁：图片/占位符与本次回复绑定定死（第二条消息触发时不覆盖第一条；且不删第一条的占位符）
     const lock = Object.assign({}, lockIn || {}, { msg: msg, sendDate: String(msg.send_date || ''), head: String(text).slice(0, 40) });
     try { lock.mesId = (lockIn && lockIn.el && lockIn.el.getAttribute) ? (lockIn.el.getAttribute('mesid') || '') : ''; } catch (e) { /* 忽略 */ }   // ⭐ 楼层号（ST .mes[mesid]，重生成时按它定位）
-    taLastJob = { text: text, name: (msg.name || msg.ch_name || '').trim() || '角色', lock: lock };   // ⭐ 供占位符「重新生成提示词」按钮重跑
+    const jobRec = { text: text, name: (msg.name || msg.ch_name || '').trim() || '角色', lock: lock };
+    taLastJob = jobRec;   // 最近任务（兜底）
+    if (lock.mesId) { taJobs.set(lock.mesId, jobRec); if (taJobs.size > 20) { const k0 = taJobs.keys().next().value; taJobs.delete(k0); } }   // ⭐ 按楼层存任务表
     console.log('[tavern-auto-img] 收到角色回复, 触发自动文生图, id=', msg.id, 'send_date=', msg.send_date);
     // 通道选择：桥活着 → 桥；桥没起 → ST 原生代理（无桥模式）；都没有 → 提示装桥
     const channel = await detectChannel();

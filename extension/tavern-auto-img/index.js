@@ -2020,8 +2020,8 @@ function buildPanelUI($host) {
             $loraBox.on('change', 'input[type=checkbox]', function () { saveSettings(); updateLoraBadge(); });
     $('#tavern-img-steps, #tavern-img-width, #tavern-img-height').on('change', saveSettings);
 
-    // 提升为模块级引用（v3 事件触发用）
-    modelSel = $select; loraBox = $loraBox; sizeSel = $sizeSel; stepsSel = $stepsSel; autoModelSel = $autoSel;
+    // 提升为模块级引用（v3 事件触发用；速度档位 v3 已改为直接输入步数/分辨率，无 sizeSel/stepsSel）
+    modelSel = $select; loraBox = $loraBox; sizeSel = null; stepsSel = null; autoModelSel = $autoSel;
     setTimeout(updateRecHint, 500);   // ⭐ 初始化推荐文案（等模型列表回填后刷新）
 
     // ── 通道状态切换（无桥模式灰化依赖桥的能力 + 中文说明；桥模式恢复原样）──

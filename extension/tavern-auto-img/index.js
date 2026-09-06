@@ -498,7 +498,7 @@ function showImage(data, lock) {
             if (!target.extra.media.some(x => x.url === url)) {
                 target.extra.media.push({ url: url, type: 'image', title: data.model || '' });
                 const isAnchor = lock && lock.el && lock.el.isConnected;
-                console.log('[ta-img][diag] showImage 挂载目标=', target.id, '| replaced=', replaced, '| elLen=', $el.length, '| 消息名=', target.name || '', '| 楼层/', isAnchor ? '锚定' : '找回', '| chat 最后=', (getCtx()?.chat?.length ?? -1));
+                console.log('[ta-img][diag] showImage 挂载目标=', (target && target.el) ? (target.el.className || 'mes元素') : (target && target.name || '?'), '| replaced=', replaced, '| elLen=', $el.length, '| 消息名=', target.name || '', '| 楼层/', isAnchor ? '锚定' : '找回', '| chat 最后=', (getCtx()?.chat?.length ?? -1));
                 // 视觉：占位符=图槽已原位替换（replaced=true）→ 完成；
                 // 否则（占位符被ST清/丢失）→ 在该楼层媒体区/尾部补插一张（图槽兜底，绝不错层）
                 if (!replaced) {

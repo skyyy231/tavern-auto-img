@@ -392,14 +392,48 @@ function addImgPlaceholder(el, msgName) {
     if (!$el.length) return;                          // 聊天区无消息：跳过（不阻断出图）
     if ($el.find('.ta-img-ph').length) return;        // 已有占位不重复（该楼层的）
     injectTaSpinKeyframes();
+    // ⭐ 占位符样式补按钮（按钮不覆盖/不换行：小圆角，醒目但不抢戏）
+    if (!window.__taRerunCss) {
+        window.__taRerunCss = true;
+        $('head').append('<style>.ta-img-rerun{margin-left:auto;flex-shrink:0;cursor:pointer;background:rgba(129,140,248,.16);color:#a5b4fc;border:1px solid rgba(129,140,248,.45);border-radius:8px;padding:4px 10px;font-size:13px;white-space:nowrap}.ta-img-rerun:hover{background:rgba(129,140,248,.3);color:#c7d2fe}</style>');
+    }
     const $txt = $el.find('.mes_text').last();
-    const html = '<div class="ta-img-ph"><span class="ta-img-spin"></span><span>自动文生图：正在生成图…（完成后自动显示）</span></div>';
+    const html = '<div class="ta-img-ph"><span class="ta-img-spin"></span><span>自动文生图：正在生成图…（完成后自动显示）</span><button class="ta-img-rerun" title="提示词不满意/卡壳时点它：重新生成提示词并重新出图">🔄 重新生成提示词</button></div>';
     if ($txt.length) {
         $txt.after(html);   // 统一文本下方（用户偏好：图在剧情文本下面）
     } else {
         $el.append(html);
     }
     console.log('[ta-img][diag] 占位符已插入（楼层=', (el && el.isConnected ? '锚定' : '找回'), '）');
+}
+// ⭐ 占位符旁「重新生成提示词」按钮：一键重跑（重新调 LLM 出题 + 重新出图），绑在当前任务的楼层上
+function taRerunPrompt() {
+    const job = taLastJob;
+    if (!job) { toastr.warning('还没有可重跑的出图任务（先发一条消息触发一次）', '自动文生图'); return; }
+    if (window.__taRerunBusy) return;
+    window.__taRerunBusy = true;
+    (async () => {
+        try {
+            console.log('[ta-img][diag] 手动「重新生成提示词」→ 全链重跑（LLM 出题→直连出图）');
+            taInterruptImageTask();
+            const channel = await detectChannel();
+            if (channel === 'st') await generateViaST(job.text, job.name || '角色', job.lock);
+            else if (channel === 'bridge') await generateViaBridge(job.text, job.name || '角色', job.lock);
+            else showError({ message: '重跑失败：ComfyUI 通道不可用（检查 ComfyUI 地址/桥）' });
+        } catch (e) {
+            console.error('[tavern-auto-img] 重新生成失败:', e);
+            taLogRun({ status: '❌ 重跑失败', error: (e?.message || '未知错误') }, true);
+            if (!(e && (e.name === 'AbortError' || /abort/i.test(String(e.message || ''))))) {
+                showError({ message: '重新生成提示词失败：' + (e?.message || '未知错误') });
+            }
+        } finally {
+            window.__taRerunBusy = false;
+        }
+    })();
+}
+if (!window.__taRerunBound) {
+    window.__taRerunBound = true;
+    $(document).on('click', '.ta-img-rerun', function () { taRerunPrompt(); });
 }
 function replaceImgPlaceholder(url, el) {
     // 占位符=图槽：原地把占位符换成成品图（绑定该楼层，不删重插、位置不变）
@@ -2358,6 +2392,7 @@ let autoGenTimer = null;
 let taAllowTrigger = false;      // 用户消息门闩：只有用户发过消息后才允许出图（切卡=锁，防历史加载自动出图）
 let taResendArmed = false;       // 重发信号（#option_regenerate 点击后 60s 内=重发窗口）
 let taResendTimer = null;        // 重发窗口超时计时器
+let taLastJob = null;            // 最近一次出图任务（文本/角色名/楼层锁）——占位符「重新生成提示词」按钮用
 let taChatChangedAt = Date.now(); // 最近一次切卡/加载时间（5 秒窗口内渲染的用户消息=历史加载，不解锁）
 let taLastUserSentDate = '';      // 最近一条用户消息 send_date（回复须晚于它；历史/开场白早于它→拦）
 
@@ -2412,6 +2447,7 @@ async function triggerOnce(msg, overrideText, lockIn) {
     if (!text) return;
     // 任务锁：图片/占位符与本次回复绑定定死（第二条消息触发时不覆盖第一条；且不删第一条的占位符）
     const lock = Object.assign({}, lockIn || {}, { msg: msg, sendDate: String(msg.send_date || ''), head: String(text).slice(0, 40) });
+    taLastJob = { text: text, name: (msg.name || msg.ch_name || '').trim() || '角色', lock: lock };   // ⭐ 供占位符「重新生成提示词」按钮重跑
     console.log('[tavern-auto-img] 收到角色回复, 触发自动文生图, id=', msg.id, 'send_date=', msg.send_date);
     // 通道选择：桥活着 → 桥；桥没起 → ST 原生代理（无桥模式）；都没有 → 提示装桥
     const channel = await detectChannel();

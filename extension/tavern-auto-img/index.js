@@ -436,16 +436,19 @@ function taRerunPrompt() {
             const el = job.lock && job.lock.el;
             if (el && el.isConnected) $(el).find('.ta-img-ph-wrap, .ta-img-done-wrap, .ta-img-fail-wrap, .ta-img-real, .ta-img-ph, .ta-img-fail, .ta-img-rerun').remove();
             else removeImgPlaceholder();
-            // ② 提示词抓取（换方式）：直接用触发时记录的原文（记录版=当时从 DOM 抓到并校验过的文本）；
-            //    DOM 重新抓只作为兜底（消息被编辑后想用新文本——但重生成=重出同一层，原文优先且绝不抓空）
+            // ② 提示词抓取（按楼层提取：结果态 DOM 稳定 → 直接用楼层号 mesid 定位消息，53层=mesid=53）
             let text = job.text || '';
             try {
-                if (!text && el && el.isConnected) {
-                    const t = ($(el).find('.mes_text').last().text() || '').trim();
-                    if (t) text = t;
+                const mesId = (job.lock && (job.lock.mesId || (job.lock.el && job.lock.el.getAttribute ? job.lock.el.getAttribute('mesid') : ''))) || '';
+                let $mes = null;
+                if (mesId) $mes = $('.mes[mesid="' + mesId + '"]');           // ⭐ 楼层号直接找该层
+                if ((!$mes || !$mes.length) && el && el.isConnected) $mes = $(el);   // 楼层号失效→对象引用兜底
+                if ($mes && $mes.length) {
+                    const t = ($mes.find('.mes_text').last().text() || '').trim();
+                    if (t) { text = t; console.log('[ta-img][diag] 重生成·按楼层提取：mesid=' + (mesId || '?') + ' → ' + text.length + '字（头30=' + text.slice(0, 30) + '）'); }
                 }
+                if (!text) console.log('[ta-img][diag] 重生成·楼层提取为空，用记录原文');
             } catch (e) { /* 忽略 */ }
-            console.log('[ta-img][diag] 重生成·提示词来源=', text ? ('记录原文 ' + text.length + '字（头30=' + text.slice(0, 30) + '）') : '空', '| 楼层DOM=', (el && el.isConnected) ? '在' : '不在');
             // ③ 过程态占位符（生成中不显示按钮）
             addImgPlaceholder(job.lock.el, job.name);
             // ④ 正常生成流程
@@ -2518,6 +2521,7 @@ async function triggerOnce(msg, overrideText, lockIn) {
     if (!text) return;
     // 任务锁：图片/占位符与本次回复绑定定死（第二条消息触发时不覆盖第一条；且不删第一条的占位符）
     const lock = Object.assign({}, lockIn || {}, { msg: msg, sendDate: String(msg.send_date || ''), head: String(text).slice(0, 40) });
+    try { lock.mesId = (lockIn && lockIn.el && lockIn.el.getAttribute) ? (lockIn.el.getAttribute('mesid') || '') : ''; } catch (e) { /* 忽略 */ }   // ⭐ 楼层号（ST .mes[mesid]，重生成时按它定位）
     taLastJob = { text: text, name: (msg.name || msg.ch_name || '').trim() || '角色', lock: lock };   // ⭐ 供占位符「重新生成提示词」按钮重跑
     console.log('[tavern-auto-img] 收到角色回复, 触发自动文生图, id=', msg.id, 'send_date=', msg.send_date);
     // 通道选择：桥活着 → 桥；桥没起 → ST 原生代理（无桥模式）；都没有 → 提示装桥

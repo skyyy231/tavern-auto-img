@@ -618,21 +618,24 @@ function showError(data) {
     const msg = (data && (data.message || data.error)) || '出图失败，请查看桥日志';
     try {
         removeImgPlaceholder();   // 失败时清掉占位符
-        toastr.error('🛑 ' + msg, '自动文生图');
-        const mes = {
-            name: '文生图',
-            is_user: false,
-            is_system: true,
-            mes: '🛑 出图失败：' + msg,
-            send_date: new Date().toISOString(),
-        };
-        chat.push(mes);
-        addOneMessage(mes);
-        saveChatDebounced();
+        // 观感：只在右上角 toastr 浮层提示（几秒消失），不再往聊天区插入"文生图"消息卡
+        toastr.error('🛑 ' + msg, '自动文生图', { timeOut: 8000 });
+        taLogRun({ status: '❌ ' + String(msg).slice(0, 80), error: String(msg).slice(0, 200) }, true);
     } catch (e) { console.error('[tavern-auto-img] 错误显示失败:', e); }
 }
 
-// ── 独立控制台（右下角 ⚡ 按钮 → 弹层面板）──────────────────
+// 清理历史遗留的"文生图"错误卡（旧版 showError 插入聊天区的系统消息，观感差 → 一键清掉）
+function taCleanErrCards() {
+    try {
+        const ctx = getCtx();
+        if (!ctx || !Array.isArray(ctx.chat)) return;
+        const before = ctx.chat.length;
+        const kept = ctx.chat.filter(m => !(m && m.is_system && m.name === '文生图' && String(m.mes || '').includes('出图失败')));
+        if (kept.length !== before) { ctx.chat.splice(0, before, ...kept); console.log('[ta-img][diag] 已清理旧文生图错误卡', before - kept.length, '条'); if (typeof saveChatDebounced === 'function') { try { saveChatDebounced(); } catch (e) { /* 忽略 */ } } }
+    } catch (e) { /* 忽略 */ }
+}
+setTimeout(taCleanErrCards, 3000);   // 页面加载 3 秒后清一次（含强制刷新/重开）
+
 let _panelReady = false;
 
 function ensureOverlay() {

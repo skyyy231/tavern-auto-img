@@ -410,10 +410,11 @@ function addImgPlaceholder(el, msgName) {
     // ⭐ 占位符样式补按钮（按钮不覆盖/不换行：小圆角，醒目但不抢戏）
     if (!window.__taRerunCss) {
         window.__taRerunCss = true;
-        $('head').append('<style>.ta-img-rerun{margin-left:auto;flex-shrink:0;cursor:pointer;background:rgba(129,140,248,.16);color:#a5b4fc;border:1px solid rgba(129,140,248,.45);border-radius:8px;padding:4px 10px;font-size:13px;white-space:nowrap}.ta-img-rerun:hover{background:rgba(129,140,248,.3);color:#c7d2fe}</style>');
+        $('head').append('<style>.ta-img-ph-wrap{display:flex;align-items:center;gap:8px;width:fit-content}.ta-img-rerun{flex-shrink:0;cursor:pointer;background:rgba(129,140,248,.16);color:#a5b4fc;border:1px solid rgba(129,140,248,.45);border-radius:8px;padding:4px 10px;font-size:13px;white-space:nowrap}.ta-img-rerun:hover{background:rgba(129,140,248,.3);color:#c7d2fe}.ta-img-fail-wrap{display:flex;align-items:center;gap:8px;width:fit-content}.ta-img-fail{display:flex;align-items:center;gap:8px;width:fit-content;margin:6px 0 10px;padding:10px 14px;border-radius:12px;background:rgba(224,85,85,.08);border:1px dashed rgba(224,85,85,.5);color:#e05555;font-size:15px}</style>');
     }
     const $txt = $el.find('.mes_text').last();
-    const html = '<div class="ta-img-ph"><span class="ta-img-spin"></span><span>自动文生图：正在生成图…（完成后自动显示）</span><button class="ta-img-rerun" title="提示词不满意/卡壳时点它：重新生成提示词并重新出图">🔄 重新生成提示词</button></div>';
+    // 生成中=纯过程：只显示占位符，不显示按钮（结果态（成功/失败）才显示 🔄）
+    const html = '<div class="ta-img-ph-wrap"><div class="ta-img-ph"><span class="ta-img-spin"></span><span>自动文生图：正在生成图…</span></div></div>';
     if ($txt.length) {
         $txt.after(html);   // 统一文本下方（用户偏好：图在剧情文本下面）
     } else {
@@ -421,7 +422,7 @@ function addImgPlaceholder(el, msgName) {
     }
     console.log('[ta-img][diag] 占位符已插入（楼层=', (el && el.isConnected ? '锚定' : '找回'), '）');
 }
-// ⭐ 占位符旁「重新生成提示词」按钮：一键重跑（重新调 LLM 出题 + 重新出图），绑在当前任务的楼层上
+// ⭐ 结果态旁「🔄 重新生成」按钮：覆盖该楼层（未生成/已生成图）→ 重新抓取本楼层消息 → 正常生成流程
 function taRerunPrompt() {
     const job = taLastJob;
     if (!job) { toastr.warning('还没有可重跑的出图任务（先发一条消息触发一次）', '自动文生图'); return; }
@@ -429,17 +430,32 @@ function taRerunPrompt() {
     window.__taRerunBusy = true;
     (async () => {
         try {
-            console.log('[ta-img][diag] 手动「重新生成提示词」→ 全链重跑（LLM 出题→直连出图）');
+            console.log('[ta-img][diag] 手动「重新生成」→ 覆盖楼层 → 重抓本楼层消息 → 正常流程');
             taInterruptImageTask();
+            // ① 清掉本楼层旧的（失败位/成品图/占位符），准备覆盖
+            const el = job.lock && job.lock.el;
+            if (el && el.isConnected) $(el).find('.ta-img-ph-wrap, .ta-img-done-wrap, .ta-img-fail-wrap, .ta-img-real, .ta-img-ph, .ta-img-fail, .ta-img-rerun').remove();
+            else removeImgPlaceholder();
+            // ② 重新抓取本楼层消息文本（楼层仍在→抓最新 DOM 文本；否则用旧记录）
+            let text = job.text || '';
+            try {
+                if (el && el.isConnected) {
+                    const t = ($(el).find('.mes_text').last().text() || '').trim();
+                    if (t) text = t;
+                }
+            } catch (e) { /* 忽略 */ }
+            // ③ 过程态占位符（生成中不显示按钮）
+            addImgPlaceholder(job.lock.el, job.name);
+            // ④ 正常生成流程
             const channel = await detectChannel();
-            if (channel === 'st') await generateViaST(job.text, job.name || '角色', job.lock);
-            else if (channel === 'bridge') await generateViaBridge(job.text, job.name || '角色', job.lock);
+            if (channel === 'st') await generateViaST(text, job.name || '角色', job.lock);
+            else if (channel === 'bridge') await generateViaBridge(text, job.name || '角色', job.lock);
             else showError({ message: '重跑失败：ComfyUI 通道不可用（检查 ComfyUI 地址/桥）' });
         } catch (e) {
             console.error('[tavern-auto-img] 重新生成失败:', e);
             taLogRun({ status: '❌ 重跑失败', error: (e?.message || '未知错误') }, true);
             if (!(e && (e.name === 'AbortError' || /abort|已被接管/i.test(String(e.message || ''))))) {
-                showError({ message: '重新生成提示词失败：' + (e?.message || '未知错误') });
+                showError({ message: '重新生成失败：' + (e?.message || '未知错误') });
             }
         } finally {
             window.__taRerunBusy = false;
@@ -451,16 +467,22 @@ if (!window.__taRerunBound) {
     $(document).on('click', '.ta-img-rerun', function () { taRerunPrompt(); });
 }
 function replaceImgPlaceholder(url, el) {
-    // 占位符=图槽：原地把占位符换成成品图（绑定该楼层，不删重插、位置不变）
+    // 占位符=图槽：原地把占位符换成成品图（绑定该楼层，不删重插、位置不变）；按钮随结果态出现
     const $p = (el && el.isConnected) ? $(el).find('.ta-img-ph').first() : $('.ta-img-ph').first();
     if (!$p.length) return false;
-    $p.replaceWith('<img class="ta-img-real" src="' + url + '" style="max-width:480px;display:block;height:auto;border-radius:12px;margin:6px 0 10px;">');
+    const $wrap = $p.closest('.ta-img-ph-wrap').length ? $p.closest('.ta-img-ph-wrap') : $p;
+    $wrap.replaceWith('<div class="ta-img-done-wrap"><img class="ta-img-real" src="' + url + '" style="max-width:480px;display:block;height:auto;border-radius:12px;margin:6px 0 10px;"><button class="ta-img-rerun" title="重新生成本楼层图片（重新抓取本楼层消息生成提示词，并覆盖该位置）">🔄 重新生成</button></div>');
+    if (!window.__taDoneCss) {
+        window.__taDoneCss = true;
+        $('head').append('<style>.ta-img-done-wrap{display:flex;align-items:flex-start;gap:8px;width:fit-content}</style>');
+    }
     console.log('[ta-img][diag] 占位符→成品图（同楼层原位替换）');
     return true;
 }
 function removeImgPlaceholder(el) {
-    if (el && el.isConnected) $(el).find('.ta-img-ph').remove();
-    else $('.ta-img-ph').remove();
+    // 只清"过程占位符"（生成中）；成品图/失败位随楼层保留（结果态由用户决定是否重新生成）
+    if (el && el.isConnected) $(el).find('.ta-img-ph-wrap, .ta-img-ph').remove();
+    else $('.ta-img-ph-wrap, .ta-img-ph').remove();
 }
 
 // 出图运行日志：每次触发记录（提示词/模型/耗时/结果），localStorage 滚动 50 条，面板可查
@@ -617,8 +639,20 @@ function showImage(data, lock) {
 function showError(data) {
     const msg = (data && (data.message || data.error)) || '出图失败，请查看桥日志';
     try {
-        removeImgPlaceholder();   // 失败时清掉占位符
-        // 观感：只在右上角 toastr 浮层提示（几秒消失），不再往聊天区插入"文生图"消息卡
+        // 失败位：该楼层原位置显示「❌ 未生成」+ 🔄 重试按钮（占位符/图的位置）；失败不消失、不弹聊天卡
+        const lock = taLastJob && taLastJob.lock;
+        const el = lock && lock.el;
+        const $target = (el && el.isConnected) ? $(el) : $('.mes[is_user="false"]').last();
+        if ($target.length) {
+            const failHtml = '<div class="ta-img-fail-wrap"><div class="ta-img-fail">❌ 未生成</div><button class="ta-img-rerun" title="重新生成本楼层图片（重新抓取本楼层消息生成提示词，并覆盖该位置）">🔄 重新生成</button></div>';
+            const $old = $target.find('.ta-img-ph-wrap, .ta-img-done-wrap, .ta-img-fail-wrap, .ta-img-real').first();
+            $target.find('.ta-img-fail-wrap, .ta-img-ph-wrap, .ta-img-ph, .ta-img-rerun, .ta-img-real').remove();   // 先清旧（防叠）
+            const $txt = $target.find('.mes_text').last();
+            if ($txt.length) $txt.after(failHtml);
+            else $target.append(failHtml);
+            console.log('[ta-img][diag] 失败位已插入（❌未生成 + 重新生成按钮）');
+        }
+        // 提示：右上角 toastr 浮层（几秒消失），不污染聊天区
         toastr.error('🛑 ' + msg, '自动文生图', { timeOut: 8000 });
         taLogRun({ status: '❌ ' + String(msg).slice(0, 80), error: String(msg).slice(0, 200) }, true);
     } catch (e) { console.error('[tavern-auto-img] 错误显示失败:', e); }

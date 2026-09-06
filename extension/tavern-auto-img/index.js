@@ -140,7 +140,7 @@ function stBuildWorkflow(modelFile, family, loras, wNum, hNum, stepsNum, positiv
 let stAbort = null;  // 无桥模式中断信号
 
 /** 无桥模式：提示词工程器（走酒馆主 API 代理，同源无密钥） */
-async function stEngineer(text, family, myEpoch) {
+async function stEngineer(text, family, myKill) {
     const llmCfg = taGetLocalCfg().llm || {};
     const llmEndpoint = (document.getElementById('tavern-img-llm-endpoint')?.value || '').trim() || llmCfg.endpoint || 'http://127.0.0.1:18789/v1';
     const llmModel = (document.getElementById('tavern-img-llm-model')?.value || '').trim() || llmCfg.model || 'openclaw/tavern';
@@ -163,7 +163,7 @@ async function stEngineer(text, family, myEpoch) {
     try { const sid = (llmCfg.secretId || '').trim(); if (sid) body.secret_id = sid; } catch (e) { /* 忽略 */ }
     // ⭐ 自动重试：LLM API 偶发不通（498/499/500/超时/空内容）→ 重试最多 3 次，并非每次都要用户看到红 toast
     let j = null, r = null, lastErr = '';
-    const epochAlive = function () { return (typeof myEpoch !== 'number') || taGenEpoch === myEpoch; };
+    const epochAlive = function () { return (typeof myKill !== 'number') || taKillGen === myKill; };
     for (let attempt = 1; attempt <= 3; attempt++) {
         if (!epochAlive()) { const e = new Error('任务已被接管（重跑/重发/切卡）'); e.name = 'AbortError'; throw e; }   // ⭐ 纪元过期=立即自杀（防与手动重跑打架）
         if (attempt > 1) {
@@ -245,8 +245,9 @@ async function stPreflight(family, comfyUrl) {
 /** 无桥模式：全链出图（工程器 → 工作流 → ST 代理 → 存文件 → 嵌入聊天） */
 async function generateViaST(text, name, lock) {
     stAbort = new AbortController();   // ⭐ 必须最先建：stEngineer 的 fetch 要用"本任务全新信号"（否则沿用已 abort 的旧信号→ signal is aborted）
-    const myEpoch = ++taGenEpoch;   // ⭐ 任务纪元号：本任务领取号码；被中断/被接管时旧任务自杀
-    console.log('[ta-img][st] ① 进入无桥出图', { textLen: (text || '').length, name, epoch: myEpoch });
+    const myGen = ++taGenEpoch;        // 任务号（仅日志/区分）
+    const myKill = taKillGen;          // ⭐ 中断代快照：只有真中断(taInterruptImageTask)会变；新任务领号=myGen 变化 → 不淘汰其它楼层任务
+    console.log('[ta-img][st] ① 进入无桥出图', { textLen: (text || '').length, name, gen: myGen });
     const localCfg = taGetLocalCfg();
     const runStart = Date.now();
     taLogRun({ channel: '🟢 无桥(ST代理)', model: '', family: '', positive: '', negative: '', status: '⏳ 进行中' });
@@ -269,11 +270,11 @@ async function generateViaST(text, name, lock) {
 
     toastr.info('🤖 提示词生成中…（无桥模式·走酒馆主 API）', '自动文生图');
     // ⭐ 被接管（AbortError）原样抛（triggerOnce 静默）；其它失败才包前缀
-    const pr = await stEngineer(text, family, myEpoch).catch(e => {
+    const pr = await stEngineer(text, family, myKill).catch(e => {
         if (e && e.name === 'AbortError') throw e;
         throw new Error('提示词生成失败:' + e.message);
     });
-    if (taGenEpoch !== myEpoch) { const e = new Error('任务已被接管'); e.name = 'AbortError'; throw e; }   // ⭐ 纪元自查
+    if (taKillGen !== myKill) { const e = new Error('任务已被接管'); e.name = 'AbortError'; throw e; }   // ⭐ 仅真中断才过期
     const negative = 'bad quality, worst quality, lowres, blurry, extra limbs, deformed hands, text, watermark'
         + (pr.male ? ', female, woman, girl, big breasts, cleavage, westerner, caucasian' : '');
     taLogRun({ positive: pr.positive, negative: negative, promptOk: true });
@@ -291,7 +292,7 @@ async function generateViaST(text, name, lock) {
 
     // ── 直连 ComfyUI：POST /prompt → WS 事件等完成 → /history 取图（零轮询）──
     const clientId = Math.random().toString(36).slice(2) + Date.now().toString(36);
-    if (taGenEpoch !== myEpoch) { const e = new Error('任务已被接管'); e.name = 'AbortError'; throw e; }   // ⭐ 纪元自查
+    if (taKillGen !== myKill) { const e = new Error('任务已被接管'); e.name = 'AbortError'; throw e; }   // ⭐ 仅真中断才过期
     const r = await fetch(comfyUrl + '/prompt', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -307,7 +308,7 @@ async function generateViaST(text, name, lock) {
     const pid = sub.prompt_id;
     if (!pid) throw new Error('ComfyUI 未返回 prompt_id');
     await waitComfyDirect(comfyUrl, pid, clientId, stAbort.signal, 240000);   // 事件驱动（WS），非轮询
-    if (taGenEpoch !== myEpoch) { const e = new Error('任务已被接管'); e.name = 'AbortError'; throw e; }   // ⭐ 纪元自查
+    if (taKillGen !== myKill) { const e = new Error('任务已被接管'); e.name = 'AbortError'; throw e; }   // ⭐ 仅真中断才过期
     // 完成后一次性 /history 取图（WS 消息可能早于落盘 → 小重试 3 次，命中即停）
     let hist = {}, imgMeta = null;
     for (let attempt = 0; attempt < 3 && !imgMeta; attempt++) {
@@ -437,8 +438,9 @@ function taRerunPrompt(evt) {
     window.__taRerunBusy = true;
     (async () => {
         try {
-            console.log('[ta-img][diag] 手动「重新生成」→ 覆盖楼层 → 重抓本楼层消息 → 正常流程');
-            taInterruptImageTask();
+            console.log('[ta-img][diag] 手动「重新生成」→ 覆盖楼层 → 按楼层重抓消息 → 正常流程');
+            // ⚠️ 不调 taInterruptImageTask（全局杀）！它只清"本层旧内容"——结果态=本层任务已结束；
+            //    若此时其它楼层任务在跑（如第三条正在生成），全局中断会误杀它们（旧 bug：点54层🔄把55层任务杀掉→54层反而死于"已被接管"）
             // ① 清掉本楼层旧的（失败位/成品图/占位符），准备覆盖
             const el = job.lock && job.lock.el;
             if (el && el.isConnected) $(el).find('.ta-img-ph-wrap, .ta-img-done-wrap, .ta-img-fail-wrap, .ta-img-real, .ta-img-ph, .ta-img-fail, .ta-img-rerun').remove();
@@ -518,7 +520,7 @@ function taGetRunLogs() {
 
 // 中断当前出图任务（包括提示词 LLM 与 ComfyUI 排队/生成中的任务）
 async function taInterruptImageTask() {
-    taGenEpoch++;   // ⭐ 纪元号+1：旧任务（含 LLM 重试循环/WS 等待）全部自杀，绝不与新任务并发打架
+    taKillGen++;   // ⭐ 中断代+1：旧任务（含 LLM 重试循环/WS 等待）全部自杀；新任务开始不再误杀其它楼层任务（它们各自持自己的 kill 快照）
     try {
         // ① 无桥：中止前端 fetch（提示词/代理请求立即停）
         if (stAbort && !stAbort.signal.aborted) {
@@ -2474,7 +2476,8 @@ let taResendArmed = false;       // 重发信号（#option_regenerate 点击后 
 let taResendTimer = null;        // 重发窗口超时计时器
 let taLastJob = null;            // 最近一次出图任务（文本/角色名/楼层锁）——占位符「重新生成提示词」按钮用
 const taJobs = new Map();        // ⭐ mesId → job：每层各存各的任务（并发场景点哪层的🔄就重跑哪层，绝不串楼层）
-let taGenEpoch = 0;              // 任务纪元号：每次新任务/中断 +1；旧任务每步自查（过期=抛 AbortError 自杀）→ 手动重跑/自动重试/重发互不打架
+let taGenEpoch = 0;              // 任务号：每次新任务 +1（仅用于日志区分；不再用于淘汰）——已改中断代机制（taKillGen）
+let taKillGen = 0;               // ⭐ 中断代：只有 taInterruptImageTask（重发/急停/切卡/重roll）才 +1 淘汰全部旧任务；新任务领号 → 不杀其它楼层任务（并发楼层可并行）
 let taChatChangedAt = Date.now(); // 最近一次切卡/加载时间（5 秒窗口内渲染的用户消息=历史加载，不解锁）
 let taLastUserSentDate = '';      // 最近一条用户消息 send_date（回复须晚于它；历史/开场白早于它→拦）
 

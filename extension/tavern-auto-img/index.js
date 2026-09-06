@@ -2526,7 +2526,8 @@ function bindMessageEvents() {
                 taInterruptImageTask();
                 removeImgPlaceholder();
                 taAllowTrigger = true;   // 重 roll 属于"已激活的会话"：保持解锁（已切卡则被 chat_id_changed 锁）
-                console.log('[ta-img][diag] message_swiped → 中断+解锁重出图, id=', msgId);
+                seenMessages.clear();    // ⭐ 重发/重roll 同文本指纹与上次相同 → 清 seen 防被"已触发"拦住（门闩+send_date 防线仍有效）
+                console.log('[ta-img][diag] message_swiped → 中断+解锁+清seen 重出图, id=', msgId);
             });
             ctx.eventSource.on('message_edited', function () {
                 taInterruptImageTask();

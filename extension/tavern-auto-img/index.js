@@ -1117,7 +1117,21 @@ function buildPanelUI($host) {
     const $rowLlmEp = $('<div style="display:flex;align-items:center;gap:8px;"></div>').append($inLlmEndpoint);
     const $rowLlmKm = $('<div style="display:flex;align-items:center;gap:8px;"></div>').append($inLlmKey, $inLlmModel);
     const $rowLlmButtons = $('<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;"></div>').append($btnTest, $btnLlmModels, $btnLlmSave);
-    $rowCustom.append($rowLlmEp, $rowLlmKm, $rowLlmButtons);
+    // ⭐ 当前生效行：与 stEngineer 实际取值逻辑完全一致（DOM 优先→本地存档→默认），保存/加载后刷新——一眼看出"存的 vs 用的"
+    const $activeLlm = $('<div style="margin:4px 0 0 2px;font-size:14px;line-height:1.5;color:#67e8f9;"></div>');
+    const updateLlmActive = function () {
+        try {
+            const domEp = (document.getElementById('tavern-img-llm-endpoint')?.value || '').trim();
+            const domMd = (document.getElementById('tavern-img-llm-model')?.value || '').trim();
+            const lc = taGetLocalCfg().llm || {};
+            const actEp = domEp || lc.endpoint || 'http://127.0.0.1:18789/v1';
+            const actMd = domMd || lc.model || 'openclaw/tavern';
+            const keyOk = !!(lc.secretId || '').trim();
+            $activeLlm.html('✅ 当前生效：自定义 API → <b>' + $('<div>').text(actEp).html().replace(/</g, '&lt;') + '</b> · ' + $('<div>').text(actMd).html().replace(/</g, '&lt;') + (keyOk ? ' · <span style="color:#8bc34a;">key ✓</span>' : ' · <span style="color:#f59e0b;">key 未配（用酒馆主 API 默认）</span>'));
+        } catch (e) { /* 忽略 */ }
+    };
+    updateLlmActive();
+    $rowCustom.append($rowLlmEp, $rowLlmKm, $rowLlmButtons, $activeLlm);
     $rowLLM.append($rowCustom);
     // 模型列表 datalist（原生下拉建议）
     const $dlModels = $('<datalist id="ta-img-llm-models"></datalist>');
@@ -1842,6 +1856,7 @@ function buildPanelUI($host) {
                 $inLlmModel.val(llm.model || '');   // key 不回填
             }
             currentLlm = { mode: mode, endpoint: llm.endpoint || '', model: llm.model || '', key_configured: !!llm.key_configured };
+            updateLlmActive();   // ⭐ 加载刷新"当前生效"
             const keySet = llm.key_configured !== undefined ? !!llm.key_configured
                 : (data.deepseek_configured !== undefined ? !!data.deepseek_configured
                     : (data.deepseek_key_set !== undefined ? !!data.deepseek_key_set
@@ -1861,6 +1876,7 @@ function buildPanelUI($host) {
                     $inLlmModel.val(llm.model || '');
                 }
                 currentLlm = { mode: mode, endpoint: llm.endpoint || '', model: llm.model || '', key_configured: !!llm.key_configured };
+                updateLlmActive();   // ⭐ 无桥加载也刷新"当前生效"
                 if (llm.endpoint || llm.model) $llmHint.text('🔑 已就绪（无桥·本地）').css('color', '#8bc34a');
                 if (lc.comfy_url) $inComfy.val(lc.comfy_url);
             } catch (e2) { /* 忽略 */ }
@@ -1977,6 +1993,7 @@ function buildPanelUI($host) {
                 toastr.success('✓ 已保存（endpoint/模型；key 未填）', '自动文生图');
             }
             currentLlm = { mode: 'custom', endpoint: endpoint, model: model, key_configured: !!key };
+            updateLlmActive();
             return;
         }
         try {
@@ -1991,6 +2008,7 @@ function buildPanelUI($host) {
                 $llmHint.text(key ? '🔑 已配置' : '🔑 未配置（未填 Key）').css('color', key ? '#8bc34a' : '');
                 toastr.success('✓ 已配置', '自动文生图');
                 currentLlm = { mode: 'custom', endpoint: endpoint, model: model, key_configured: !!key };
+                updateLlmActive();
             } else {
                 toastr.error(data.error || '保存失败', '自动文生图');
             }

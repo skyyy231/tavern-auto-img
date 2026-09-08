@@ -3,6 +3,7 @@
 // ② 设置面板：模型下拉 + LoRA 勾选清单 + 速度档位(尺寸/步数倍率) + 总开关 → POST 8645/model 持久化
 import { chat, addOneMessage, saveChatDebounced, getRequestHeaders, appendMediaToMessage } from '../../../../script.js';
 import { saveBase64AsFile } from '../../../utils.js';
+import { initTaUpdate } from './update.js';   // ⭐ 独立更新模块（模块化第1弹：请勿在此文件里改更新逻辑）
 
 const BRIDGE = 'http://127.0.0.1:8645';
 let eventSource = null;
@@ -2801,6 +2802,7 @@ function bindMessageEvents() {
 function init() {
     console.log('[tavern-auto-img] 初始化 v3.0...');   // ⭐ 版号验证：v3.0-dca1974 = max_tokens 3000 已生效；没这行或旧串 = 页面在跑旧 JS（缓存），Ctrl+Shift+R 或换无痕窗口
     console.log('[tavern-auto-img] v3.0-dca1974 (max_tokens=3000, reasoning修复)');
+    try { setTimeout(() => { try { initTaUpdate(); } catch (e) { console.warn('[ta-img][update] 初始化失败', e); } }, 1500); } catch (e) { /* 忽略 */ }   // ⭐ 更新模块（独立文件，此处仅启动）
     ensureOverlay();          // 右下角 ⚡ + 控制台浮层（面板本体在此）
     buildSettingsUI();        // 设置区只留"打开控制台"入口
     connect();
